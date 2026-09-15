@@ -1,0 +1,118 @@
+From 0aec3a76f56989b581ec53aaae3808f2a13adf2d Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Tue, 15 Sep 2026 10:31:07 -0700
+Subject: [PATCH 30/32] drm/xe: Size the exec drm_exec object array from the
+ previous lock
+
+drm_gpuvm_exec_lock() calls drm_exec_init(exec, flags, 0), which allocates
+and zeroes a fixed 512-pointer (4 KiB) kvmalloc array and frees it again on
+every exec and every VM bind. In the exec profile that pair (kvmalloc +
+memset + kvfree) was ~5% of the ioctl's cycles, for an array that typically
+holds ~10 objects (a GL client) to ~40 (the compositor).
+
+Open-code the lock sequence in xe_validation.c (drm_gpuvm_prepare_vm(),
+drm_gpuvm_prepare_objects() and the extra callback are all exported) and
+size the array from the object count the previous lock of the same VM ended
+up with, plus a little slack, minimum 8. drm_exec still doubles the array on
+demand, so a VM that gains external BOs between two locks only pays one
+realloc.
+
+Assisted-by: Claude:claude-fable-5-1
+---
+ drivers/gpu/drm/xe/xe_validation.c | 48 +++++++++++++++++++++++++++++-
+ drivers/gpu/drm/xe/xe_vm_types.h   |  6 ++++
+ 2 files changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_validation.c b/drivers/gpu/drm/xe/xe_validation.c
+index 8dff4d0..dfc0fbc 100644
+--- a/drivers/gpu/drm/xe/xe_validation.c
++++ b/drivers/gpu/drm/xe/xe_validation.c
+@@ -8,6 +8,7 @@
+ 
+ #include "xe_assert.h"
+ #include "xe_validation.h"
++#include "xe_vm.h"
+ 
+ #ifdef CONFIG_DRM_XE_DEBUG
+ /**
+@@ -203,6 +204,51 @@ static bool __xe_validation_should_retry(struct xe_validation_ctx *ctx, int ret)
+  *
+  * Return: %0 on success, negative error code on failure.
+  */
++/*
++ * drm_gpuvm_exec_lock(), except that the drm_exec object array is sized from
++ * the object count of the previous lock of the same VM instead of the fixed
++ * 512-entry (4 KiB, kvmalloc + memset) array drm_exec_init() uses for nr = 0.
++ * A plain GL client locks ~10 objects per exec, the compositor ~40; the array
++ * still grows on demand if a VM gains external BOs between two locks.
++ */
++static int xe_gpuvm_exec_lock(struct drm_gpuvm_exec *vm_exec)
++{
++	struct drm_gpuvm *gpuvm = vm_exec->vm;
++	struct xe_vm *vm = gpuvm_to_vm(gpuvm);
++	struct drm_exec *exec = &vm_exec->exec;
++	unsigned int num_fences = vm_exec->num_fences;
++	int ret;
++
++	drm_exec_init(exec, vm_exec->flags,
++		      max(READ_ONCE(vm->exec_nr_objs) + 2, 8u));
++
++	drm_exec_until_all_locked(exec) {
++		ret = drm_gpuvm_prepare_vm(gpuvm, exec, num_fences);
++		drm_exec_retry_on_contention(exec);
++		if (ret)
++			goto err;
++
++		ret = drm_gpuvm_prepare_objects(gpuvm, exec, num_fences);
++		drm_exec_retry_on_contention(exec);
++		if (ret)
++			goto err;
++
++		if (vm_exec->extra.fn) {
++			ret = vm_exec->extra.fn(vm_exec);
++			drm_exec_retry_on_contention(exec);
++			if (ret)
++				goto err;
++		}
++	}
++
++	WRITE_ONCE(vm->exec_nr_objs, exec->num_objects);
++	return 0;
++
++err:
++	drm_exec_fini(exec);
++	return ret;
++}
++
+ int xe_validation_exec_lock(struct xe_validation_ctx *ctx,
+ 			    struct drm_gpuvm_exec *vm_exec,
+ 			    struct xe_validation_device *val)
+@@ -222,7 +268,7 @@ retry:
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = drm_gpuvm_exec_lock(vm_exec);
++	ret = xe_gpuvm_exec_lock(vm_exec);
+ 	if (ret) {
+ 		xe_validation_unlock(ctx);
+ 		if (__xe_validation_should_retry(ctx, ret))
+diff --git a/drivers/gpu/drm/xe/xe_vm_types.h b/drivers/gpu/drm/xe/xe_vm_types.h
+index 61d2265..fa603d9 100644
+--- a/drivers/gpu/drm/xe/xe_vm_types.h
++++ b/drivers/gpu/drm/xe/xe_vm_types.h
+@@ -216,6 +216,12 @@ struct xe_vm {
+ 	 */
+ 	unsigned long last_exec_jiffies;
+ 
++	/**
++	 * @exec_nr_objs: number of GEM objects the last drm_gpuvm_exec lock of
++	 * this VM ended up with; sizes the next lock's drm_exec object array.
++	 */
++	unsigned int exec_nr_objs;
++
+ 	/** @svm: Shared virtual memory state */
+ 	struct {
+ 		/** @svm.gpusvm: base GPUSVM used to track fault allocations */
+-- 
+2.55.0
+

@@ -1,0 +1,61 @@
+From eeb462f213f4978c54fd869afec315350cadd65e Mon Sep 17 00:00:00 2001
+From: Karthik Poosa <karthik.poosa@intel.com>
+Date: Tue, 15 Sep 2026 10:25:08 -0700
+Subject: [PATCH 23/32] drm/xe/pcode: Increase default pcode mailbox timeout to
+ 10ms
+
+The previous 1ms timeout may be insufficient for some mailbox commands,
+leading to spurious -ETIMEDOUT failures under load. Increase the default
+timeout to 10ms and introduce PCODE_DEFAULT_TIMEOUT_MS for a shared
+timeout definition, in line with pcode mailbox specification guidance.
+
+Signed-off-by: Karthik Poosa <karthik.poosa@intel.com>
+Link: https://patch.msgid.link/20260907083520.192418-2-karthik.poosa@intel.com
+Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+
+(cherry picked from drm-xe-next commit 8721a51d44733b8b5cb41fa1bfe7fac2cf55107b;
+hand-ported to 7.2.5: xe_pcode_read() names its data pointers val/val1 there)
+---
+ drivers/gpu/drm/xe/xe_pcode.c | 2 +-
+ drivers/gpu/drm/xe/xe_pcode.h | 4 +++-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_pcode.c b/drivers/gpu/drm/xe/xe_pcode.c
+index dc66d0c..2112469 100644
+--- a/drivers/gpu/drm/xe/xe_pcode.c
++++ b/drivers/gpu/drm/xe/xe_pcode.c
+@@ -137,7 +137,7 @@ int xe_pcode_read(struct xe_tile *tile, u32 mbox, u32 *val, u32 *val1)
+ 	int err;
+ 
+ 	mutex_lock(&tile->pcode.lock);
+-	err = pcode_mailbox_rw(tile, mbox, val, val1, 1, true, false);
++	err = pcode_mailbox_rw(tile, mbox, val, val1, PCODE_DEFAULT_TIMEOUT_MS, true, false);
+ 	mutex_unlock(&tile->pcode.lock);
+ 
+ 	return err;
+diff --git a/drivers/gpu/drm/xe/xe_pcode.h b/drivers/gpu/drm/xe/xe_pcode.h
+index 490e4f2..8f1c24e 100644
+--- a/drivers/gpu/drm/xe/xe_pcode.h
++++ b/drivers/gpu/drm/xe/xe_pcode.h
+@@ -12,6 +12,8 @@ struct drm_device;
+ struct xe_device;
+ struct xe_tile;
+ 
++#define PCODE_DEFAULT_TIMEOUT_MS	10
++
+ void xe_pcode_init(struct xe_tile *tile);
+ int xe_pcode_probe_early(struct xe_device *xe);
+ int xe_pcode_ready(struct xe_device *xe, bool locked);
+@@ -24,7 +26,7 @@ int xe_pcode_write64_timeout(struct xe_tile *tile, u32 mbox, u32 data0,
+ 			     u32 data1, int timeout);
+ 
+ #define xe_pcode_write(tile, mbox, val) \
+-	xe_pcode_write_timeout(tile, mbox, val, 1)
++	xe_pcode_write_timeout(tile, mbox, val, PCODE_DEFAULT_TIMEOUT_MS)
+ 
+ int xe_pcode_request(struct xe_tile *tile, u32 mbox, u32 request,
+ 		     u32 reply_mask, u32 reply, int timeout_ms);
+-- 
+2.55.0
+

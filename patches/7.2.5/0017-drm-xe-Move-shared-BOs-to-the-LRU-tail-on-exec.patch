@@ -1,7 +1,7 @@
 From aa7d907035d3aab9d99884af34a104c719cddd42 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Mon, 14 Sep 2026 23:01:49 -0600
-Subject: [PATCH 17/22] drm/xe: Move shared BOs to the LRU tail on exec
+Subject: [PATCH 17/32] drm/xe: Move shared BOs to the LRU tail on exec
 
 exec only bulk-moves VM-private BOs to the LRU tail. Exported and imported
 BOs (compositor swapchains, browser shared images, video surfaces) kept

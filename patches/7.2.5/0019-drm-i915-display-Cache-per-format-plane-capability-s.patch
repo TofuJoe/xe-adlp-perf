@@ -1,7 +1,7 @@
 From 4f4f1f3282676ddf50d8e7faa38e299cff4c021a Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Mon, 14 Sep 2026 23:01:49 -0600
-Subject: [PATCH 19/22] drm/i915/display: Cache per-format plane capability
+Subject: [PATCH 19/32] drm/i915/display: Cache per-format plane capability
  scans for fb creation
 
 intel_framebuffer_init() and intel_fill_fb_info() scan every plane's format

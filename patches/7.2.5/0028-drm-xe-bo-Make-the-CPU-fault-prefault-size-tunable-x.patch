@@ -1,0 +1,94 @@
+From bc2ad53f5068a719497f4678e3dd7cecf7f649fc Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Tue, 15 Sep 2026 10:29:54 -0700
+Subject: [PATCH 28/32] drm/xe/bo: Make the CPU fault prefault size tunable
+ (xe.prefault_pages)
+
+__xe_bo_cpu_fault() always asked TTM for TTM_BO_VM_NUM_PREFAULT (16) pages
+per fault. Under memory pressure the fault handler ran ~775 times a second
+at ~40 us each, of which roughly 25 us is fixed per-fault cost (exception
+entry, validation context, resv trylock, migrate check, idle wait) and
+~1 us per inserted PTE, while the TT is already fully populated. Browser
+upload buffers are written sequentially, so a 2 MiB BO took 32 faults.
+
+Add xe.prefault_pages (default 512, 0 = TTM default) and use it for
+system-memory BOs; ttm_bo_vm_fault_reserved() already stops at the end of
+the VMA and of the BO. VRAM keeps the TTM default. A BO that is touched
+sparsely pays a few hundred microseconds once per 2 MiB instead.
+
+Assisted-by: Claude:claude-fable-5-1
+---
+ drivers/gpu/drm/xe/xe_bo.c     | 15 ++++++++++++++-
+ drivers/gpu/drm/xe/xe_module.c |  5 +++++
+ drivers/gpu/drm/xe/xe_module.h |  1 +
+ 3 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_bo.c b/drivers/gpu/drm/xe/xe_bo.c
+index af1cf70..069979a 100644
+--- a/drivers/gpu/drm/xe/xe_bo.c
++++ b/drivers/gpu/drm/xe/xe_bo.c
+@@ -2081,12 +2081,25 @@ static int xe_bo_fault_migrate(struct xe_bo *bo, struct ttm_operation_ctx *ctx,
+ /* Call into TTM to populate PTEs, and register bo for PTE removal on runtime suspend. */
+ static vm_fault_t __xe_bo_cpu_fault(struct vm_fault *vmf, struct xe_device *xe, struct xe_bo *bo)
+ {
++	pgoff_t num_prefault;
+ 	vm_fault_t ret;
+ 
+ 	trace_xe_bo_cpu_fault(bo);
+ 
++	/*
++	 * Every fault pays ~25 us of fixed cost (exception entry, validation
++	 * context, resv trylock, migrate check, idle wait) and ~1 us per
++	 * inserted page, and the whole TT is already populated. Browser upload
++	 * buffers are touched sequentially, so mapping a 2 MiB BO in one fault
++	 * instead of 32 is a clear win for system-memory BOs; VRAM keeps the
++	 * TTM default. The loop in TTM stops at the end of the VMA or the BO.
++	 */
++	num_prefault = READ_ONCE(xe_modparam.prefault_pages);
++	if (!num_prefault || mem_type_is_vram(bo->ttm.resource->mem_type))
++		num_prefault = TTM_BO_VM_NUM_PREFAULT;
++
+ 	ret = ttm_bo_vm_fault_reserved(vmf, vmf->vma->vm_page_prot,
+-				       TTM_BO_VM_NUM_PREFAULT);
++				       num_prefault);
+ 	/*
+ 	 * When TTM is actually called to insert PTEs, ensure no blocking conditions
+ 	 * remain, in which case TTM may drop locks and return VM_FAULT_RETRY.
+diff --git a/drivers/gpu/drm/xe/xe_module.c b/drivers/gpu/drm/xe/xe_module.c
+index c737af8..1c3085f 100644
+--- a/drivers/gpu/drm/xe/xe_module.c
++++ b/drivers/gpu/drm/xe/xe_module.c
+@@ -33,6 +33,7 @@ struct xe_modparam xe_modparam = {
+ 	.flip_boost =		true,
+ 	.tlb_inval_coalesce =	true,
+ 	.shrink_active_ms =	1000,
++	.prefault_pages =	512,
+ 	/* the rest are 0 by default */
+ };
+ 
+@@ -49,6 +50,10 @@ MODULE_PARM_DESC(shrink_active_ms, "Don't let kswapd back up BOs of a VM that su
+ 		 "or shared BOs used by a submission, within this many ms, while they have no pending GPU work; "
+ 		 "0 disables [default=1000]");
+ 
++module_param_named(prefault_pages, xe_modparam.prefault_pages, uint, 0600);
++MODULE_PARM_DESC(prefault_pages, "Pages to map per CPU fault on a system-memory BO, from the "
++		 "faulting page to the end of the mapping; 0 = TTM default (16) [default=512]");
++
+ module_param_named(tlb_inval_coalesce, xe_modparam.tlb_inval_coalesce, bool, 0600);
+ MODULE_PARM_DESC(tlb_inval_coalesce, "On GPUs without range TLB invalidation, merge full PPGTT "
+ 		 "TLB invalidations requested while one is still in flight [default=true]");
+diff --git a/drivers/gpu/drm/xe/xe_module.h b/drivers/gpu/drm/xe/xe_module.h
+index ffd6e3f..26b93fd 100644
+--- a/drivers/gpu/drm/xe/xe_module.h
++++ b/drivers/gpu/drm/xe/xe_module.h
+@@ -28,6 +28,7 @@ struct xe_modparam {
+ 	bool flip_boost;
+ 	bool tlb_inval_coalesce;
+ 	unsigned int shrink_active_ms;
++	unsigned int prefault_pages;
+ };
+ 
+ extern struct xe_modparam xe_modparam;
+-- 
+2.55.0
+

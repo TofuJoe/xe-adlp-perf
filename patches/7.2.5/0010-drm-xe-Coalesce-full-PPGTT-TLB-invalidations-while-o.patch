@@ -1,7 +1,7 @@
 From e342899cf7263989bd3449b62b33650a86e8624c Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Mon, 14 Sep 2026 16:30:49 -0700
-Subject: [PATCH 10/22] drm/xe: Coalesce full PPGTT TLB invalidations while one
+Subject: [PATCH 10/32] drm/xe: Coalesce full PPGTT TLB invalidations while one
  is in flight
 
 Platforms without range TLB invalidation (e.g. Xe-LP) send every PPGTT

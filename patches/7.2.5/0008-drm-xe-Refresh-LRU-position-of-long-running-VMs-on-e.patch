@@ -1,7 +1,7 @@
 From f7898ca524181c5e0f76b0cab49c2e55c6bd2218 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Mon, 14 Sep 2026 16:26:00 -0700
-Subject: [PATCH 08/22] drm/xe: Refresh LRU position of long-running VMs on
+Subject: [PATCH 08/32] drm/xe: Refresh LRU position of long-running VMs on
  exec
 
 For VMs in dma-fence mode, exec moves the VM private BOs to the LRU tail on

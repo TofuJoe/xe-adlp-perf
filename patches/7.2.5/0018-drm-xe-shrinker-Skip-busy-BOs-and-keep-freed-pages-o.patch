@@ -1,7 +1,7 @@
 From 8bbbe7d5229432b42c874b3cfd487a331620be41 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Mon, 14 Sep 2026 23:01:49 -0600
-Subject: [PATCH 18/22] drm/xe/shrinker: Skip busy BOs and keep freed pages on
+Subject: [PATCH 18/32] drm/xe/shrinker: Skip busy BOs and keep freed pages on
  error
 
 The shrinker walk returned at the first BO that could not be shrunk, and

@@ -1,7 +1,7 @@
 From 44436d113e7c6a8a417091c85dcc95d8bef68be1 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Mon, 14 Sep 2026 16:23:42 -0700
-Subject: [PATCH 06/22] drm/xe: Boost GT min frequency when a page flip misses
+Subject: [PATCH 06/32] drm/xe: Boost GT min frequency when a page flip misses
  vblank
 
 The display calls the parent rps boost_if_not_started hook at the vblank

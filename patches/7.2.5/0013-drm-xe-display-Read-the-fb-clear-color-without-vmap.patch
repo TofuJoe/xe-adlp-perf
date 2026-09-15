@@ -1,7 +1,7 @@
 From 7466b1600a17d6ec9c55aaa018ba37314c0247ca Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Mon, 14 Sep 2026 21:15:19 -0600
-Subject: [PATCH 13/22] drm/xe/display: Read the fb clear color without vmap
+Subject: [PATCH 13/32] drm/xe/display: Read the fb clear color without vmap
 
 intel_atomic_prepare_plane_clear_colors() reads 8 bytes from the pinned fb
 on every commit. xe_bo_read() goes through ttm_bo_access(), which takes the

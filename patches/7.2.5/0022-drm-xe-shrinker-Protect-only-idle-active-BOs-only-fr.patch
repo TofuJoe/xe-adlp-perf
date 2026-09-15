@@ -1,7 +1,7 @@
 From 6d263067e2d9a3fed65811e3593e9d101b9d823e Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Tue, 15 Sep 2026 07:57:04 -0600
-Subject: [PATCH 22/22] drm/xe/shrinker: Protect only idle active BOs, only
+Subject: [PATCH 22/32] drm/xe/shrinker: Protect only idle active BOs, only
  from kswapd (review)
 
 Follow-up to "Leave BOs of actively used VMs alone":

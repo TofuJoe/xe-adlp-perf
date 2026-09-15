@@ -1,7 +1,7 @@
 From 243c795745c85e68e7ad520609a07987dbb2fd77 Mon Sep 17 00:00:00 2001
 From: Imre Deak <imre.deak@intel.com>
 Date: Mon, 1 Jun 2026 13:34:57 +0300
-Subject: [PATCH 03/22] drm/i915/xe: Enable HPD polling later during system
+Subject: [PATCH 03/32] drm/i915/xe: Enable HPD polling later during system
  resume
 
 The detect hook of connectors - called by HPD polling - will check if

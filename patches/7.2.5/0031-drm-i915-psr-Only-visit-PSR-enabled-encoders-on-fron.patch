@@ -1,0 +1,108 @@
+From 0a48276343a4fea376f773c24f11c4dac52141e5 Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Tue, 15 Sep 2026 10:31:29 -0700
+Subject: [PATCH 31/32] drm/i915/psr: Only visit PSR-enabled encoders on
+ frontbuffer flush/invalidate
+
+intel_psr_flush() and intel_psr_invalidate() walked every encoder of the
+device through for_each_intel_encoder_with_psr(), calling
+intel_encoder_can_psr() on each (intel_encoder_is_dp() plus two dereferences
+of the DP's PSR capabilities) to find the one or two whose PSR is enabled.
+On ADL-P that is 14 encoders, and the flush runs twice per atomic commit
+(frontbuffer flip and flush), so the profile showed 28
+intel_encoder_can_psr() calls and ~5-13 us in intel_psr_flush() per frame.
+
+Keep a drm_encoder_mask() bitmask of the encoders whose PSR is enabled on
+struct intel_display: set at the top of intel_psr_enable_locked(), before
+psr.enabled becomes true, and cleared in intel_psr_disable_locked() right
+after it goes false, both under psr.lock. The flush and invalidate paths
+read the mask locklessly, return early when it is empty, and only take
+psr.lock (and re-check psr.enabled, as before) for encoders in the mask.
+A reader that sees a bit locks and checks the real state; one that does
+not see a bit could only miss an encoder whose PSR is not enabled yet.
+
+Assisted-by: Claude:claude-fable-5-1
+---
+ .../gpu/drm/i915/display/intel_display_core.h   | 10 ++++++++++
+ drivers/gpu/drm/i915/display/intel_psr.c        | 17 ++++++++++++++---
+ 2 files changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_core.h b/drivers/gpu/drm/i915/display/intel_display_core.h
+index d7c45cc..9a17971 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_core.h
++++ b/drivers/gpu/drm/i915/display/intel_display_core.h
+@@ -664,6 +664,16 @@ struct intel_display {
+ 	struct intel_wm wm;
+ 
+ 	struct work_struct psr_dc5_dc6_wa_work;
++
++	/*
++	 * drm_encoder_mask() bits of the encoders whose PSR / Panel Replay is
++	 * enabled or being enabled. Lets the per-frame frontbuffer flush and
++	 * invalidate visit only those instead of testing every encoder. A bit
++	 * is set before intel_dp->psr.enabled becomes true and cleared after it
++	 * is false, under intel_dp->psr.lock; readers take that lock and
++	 * re-check psr.enabled for the encoders they visit.
++	 */
++	unsigned long psr_enabled_encoders;
+ };
+ 
+ #endif /* __INTEL_DISPLAY_CORE_H__ */
+diff --git a/drivers/gpu/drm/i915/display/intel_psr.c b/drivers/gpu/drm/i915/display/intel_psr.c
+index 8712810..df80108 100644
+--- a/drivers/gpu/drm/i915/display/intel_psr.c
++++ b/drivers/gpu/drm/i915/display/intel_psr.c
+@@ -2244,6 +2244,10 @@ static void intel_psr_enable_locked(struct intel_dp *intel_dp,
+ 
+ 	drm_WARN_ON(display->drm, intel_dp->psr.enabled);
+ 
++	/* Published before psr.enabled so no frontbuffer flush can miss us. */
++	set_bit(drm_encoder_index(&dig_port->base.base),
++		&display->psr_enabled_encoders);
++
+ 	intel_dp->psr.sel_update_enabled = crtc_state->has_sel_update;
+ 	intel_dp->psr.panel_replay_enabled = crtc_state->has_panel_replay;
+ 	intel_dp->psr.busy_frontbuffer_bits = 0;
+@@ -2438,6 +2442,8 @@ static void intel_psr_disable_locked(struct intel_dp *intel_dp)
+ 		intel_dmc_block_pkgc(display, intel_dp->psr.pipe, false);
+ 
+ 	intel_dp->psr.enabled = false;
++	clear_bit(drm_encoder_index(&dp_to_dig_port(intel_dp)->base.base),
++		  &display->psr_enabled_encoders);
+ 	intel_dp->psr.panel_replay_enabled = false;
+ 	intel_dp->psr.sel_update_enabled = false;
+ 	intel_dp->psr.psr2_sel_fetch_enabled = false;
+@@ -3646,12 +3652,13 @@ static void _psr_invalidate_handle(struct intel_dp *intel_dp)
+ void intel_psr_invalidate(struct intel_display *display,
+ 			  unsigned frontbuffer_bits, enum fb_op_origin origin)
+ {
++	unsigned long enabled = READ_ONCE(display->psr_enabled_encoders);
+ 	struct intel_encoder *encoder;
+ 
+-	if (origin == ORIGIN_FLIP)
++	if (origin == ORIGIN_FLIP || !enabled)
+ 		return;
+ 
+-	for_each_intel_encoder_with_psr(display->drm, encoder) {
++	for_each_intel_encoder_mask_with_psr(display->drm, encoder, enabled) {
+ 		unsigned int pipe_frontbuffer_bits = frontbuffer_bits;
+ 		struct intel_dp *intel_dp = enc_to_intel_dp(encoder);
+ 
+@@ -3758,9 +3765,13 @@ static void _psr_flush_handle(struct intel_dp *intel_dp)
+ void intel_psr_flush(struct intel_display *display,
+ 		     unsigned frontbuffer_bits, enum fb_op_origin origin)
+ {
++	unsigned long enabled = READ_ONCE(display->psr_enabled_encoders);
+ 	struct intel_encoder *encoder;
+ 
+-	for_each_intel_encoder_with_psr(display->drm, encoder) {
++	if (!enabled)
++		return;
++
++	for_each_intel_encoder_mask_with_psr(display->drm, encoder, enabled) {
+ 		unsigned int pipe_frontbuffer_bits = frontbuffer_bits;
+ 		struct intel_dp *intel_dp = enc_to_intel_dp(encoder);
+ 
+-- 
+2.55.0
+

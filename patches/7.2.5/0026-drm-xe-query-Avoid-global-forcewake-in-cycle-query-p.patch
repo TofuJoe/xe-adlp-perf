@@ -1,0 +1,49 @@
+From d144e90ead859c97c043ab1c890c2569552b977d Mon Sep 17 00:00:00 2001
+From: Xin Wang <x.wang@intel.com>
+Date: Thu, 4 Jun 2026 22:19:44 -0700
+Subject: [PATCH 26/32] drm/xe/query: Avoid global forcewake in cycle query
+ path
+
+Engine cycle query is a lightweight timestamp path and should not wake
+unrelated GT domains. Limit forcewake scope to what the query actually
+needs.
+
+Suggested-by: Matt Roper <matthew.d.roper@intel.com>
+Signed-off-by: Xin Wang <x.wang@intel.com>
+Reviewed-by: Matt Roper <matthew.d.roper@intel.com>
+Link: https://patch.msgid.link/20260605051944.1541085-1-x.wang@intel.com
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+
+(cherry picked from v7.3-rc1 commit 9f89a6de30f74db97b3f36797a0cabe057b06c2a; applied to 7.2.5 unchanged)
+---
+ drivers/gpu/drm/xe/xe_query.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_query.c b/drivers/gpu/drm/xe/xe_query.c
+index 8c7d544..dc975f5 100644
+--- a/drivers/gpu/drm/xe/xe_query.c
++++ b/drivers/gpu/drm/xe/xe_query.c
+@@ -119,6 +119,7 @@ query_engine_cycles(struct xe_device *xe,
+ 	struct drm_xe_engine_class_instance *eci;
+ 	struct drm_xe_query_engine_cycles resp;
+ 	size_t size = sizeof(resp);
++	enum xe_force_wake_domains fw_domain;
+ 	__ktime_func_t cpu_clock;
+ 	struct xe_hw_engine *hwe;
+ 	struct xe_gt *gt;
+@@ -154,8 +155,10 @@ query_engine_cycles(struct xe_device *xe,
+ 	if (!hwe)
+ 		return -EINVAL;
+ 
+-	xe_with_force_wake(fw_ref, gt_to_fw(gt), XE_FORCEWAKE_ALL) {
+-		if (!xe_force_wake_ref_has_domain(fw_ref.domains, XE_FORCEWAKE_ALL))
++	fw_domain = xe_hw_engine_to_fw_domain(hwe);
++
++	xe_with_force_wake(fw_ref, gt_to_fw(gt), fw_domain) {
++		if (!xe_force_wake_ref_has_domain(fw_ref.domains, fw_domain))
+ 			return -EIO;
+ 
+ 		hwe_read_timestamp(hwe, &resp.engine_cycles, &resp.cpu_timestamp,
+-- 
+2.55.0
+

@@ -1,7 +1,7 @@
 From 7b4fc6193e05314c196bf29b807b7460a6c620e2 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Thu, 10 Sep 2026 12:18:22 +0000
-Subject: [PATCH 02/22] drm/xe/guc: Fix wake_up race in handle_sched_done
+Subject: [PATCH 02/32] drm/xe/guc: Fix wake_up race in handle_sched_done
 
 Original author: Jakub Legowski (intel-xe list, v3; address redacted in the archive).
 Recovered unchanged from https://ratatoskr.run/intel-xe/2026/09/17545816

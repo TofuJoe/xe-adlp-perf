@@ -1,7 +1,7 @@
 From ed1565a2590eb4a1a46b50a4f8243f73d33d9f38 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Mon, 14 Sep 2026 21:15:19 -0600
-Subject: [PATCH 12/22] drm/xe/bo: Track a backing generation per BO
+Subject: [PATCH 12/32] drm/xe/bo: Track a backing generation per BO
 
 Add bo->backing_gen, a globally unique value renewed whenever a BO's pages,
 resource or DMA mapping may change: creation, TT create/populate/unpopulate,

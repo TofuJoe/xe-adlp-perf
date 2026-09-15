@@ -1,7 +1,7 @@
 From 4d12fb9db23a009e87dd3c196c3f08f5d585591c Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Mon, 14 Sep 2026 23:15:59 -0600
-Subject: [PATCH 20/22] drm/xe/shrinker: Only skip BOs that were not attempted
+Subject: [PATCH 20/32] drm/xe/shrinker: Only skip BOs that were not attempted
 
 Follow-up to "Skip busy BOs and keep freed pages on error" (review):
 ttm_bo_shrink() maps backup and validate failures (swap full, -ENOMEM,

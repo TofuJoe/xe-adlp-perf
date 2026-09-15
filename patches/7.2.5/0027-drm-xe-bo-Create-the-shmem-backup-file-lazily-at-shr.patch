@@ -1,0 +1,101 @@
+From d6f5e7fa6e97513852a528e6710347d84213c2f6 Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Tue, 15 Sep 2026 10:29:27 -0700
+Subject: [PATCH 27/32] drm/xe/bo: Create the shmem backup file lazily, at
+ shrink time
+
+xe_ttm_tt_create() called ttm_tt_setup_backup() for every non-sg TT, which
+allocates a shmem inode (~25 us measured, plus its teardown on destroy) for
+every BO: user BOs, but also pinned kernel BOs, DPT/DSB/GGTT BOs and every
+4 KiB page-table BO (one per 2 MiB of bound VA), none of which can ever be
+shrunk. Browser workloads create and destroy tens of 2 MiB BOs per second
+and their page tables with them, so the inode churn was a measurable share
+of BO create/destroy cost for no benefit.
+
+Create the backup file in the shrinker instead, right before ttm_bo_shrink()
+needs it (ttm_tt_backup() WARNs on a NULL backup), for both the purge and
+the writeback paths. If the inode cannot be allocated, return -EBUSY before
+the BO is accounted as scanned, which the walk treats as "skip this BO".
+Suspend/hibernate uses a separate backup object and is unaffected.
+
+Assisted-by: Claude:claude-fable-5-1
+---
+ drivers/gpu/drm/xe/xe_bo.c | 39 ++++++++++++++++++++++++++++++--------
+ 1 file changed, 31 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_bo.c b/drivers/gpu/drm/xe/xe_bo.c
+index c5e3d69..af1cf70 100644
+--- a/drivers/gpu/drm/xe/xe_bo.c
++++ b/drivers/gpu/drm/xe/xe_bo.c
+@@ -564,18 +564,30 @@ static struct ttm_tt *xe_ttm_tt_create(struct ttm_buffer_object *ttm_bo,
+ 		return NULL;
+ 	}
+ 
+-	if (ttm_bo->type != ttm_bo_type_sg) {
+-		err = ttm_tt_setup_backup(tt);
+-		if (err) {
+-			ttm_tt_fini(tt);
+-			kfree(xe_tt);
+-			return NULL;
+-		}
+-	}
++	/*
++	 * The shmem backup file that the shrinker writes pages into is created
++	 * lazily by xe_tt_ensure_backup() the first time the BO is actually
++	 * shrunk. Creating it here cost ~25 us per BO (an inode plus its
++	 * teardown on destroy) for every BO, including pinned, kernel and
++	 * page-table BOs that can never be shrunk.
++	 */
+ 
+ 	return tt;
+ }
+ 
++/*
++ * Make sure @tt has the shmem backup ttm_tt_backup() requires. Called with the
++ * BO reserved, from the shrinker only, so the file is created at most once and
++ * only for BOs that are really about to be backed up or purged.
++ */
++static int xe_tt_ensure_backup(struct ttm_tt *tt)
++{
++	if (likely(tt->backup))
++		return 0;
++
++	return ttm_tt_setup_backup(tt);
++}
++
+ static int xe_ttm_tt_populate(struct ttm_device *ttm_dev, struct ttm_tt *tt,
+ 			      struct ttm_operation_ctx *ctx)
+ {
+@@ -1260,6 +1272,10 @@ static long xe_bo_shrink_purge(struct ttm_operation_ctx *ctx,
+ 		ttm_bo_move_null(bo, new_resource);
+ 	}
+ 
++	/* Rejected before any shrinking started: the walk skips this BO. */
++	if (xe_tt_ensure_backup(bo->ttm))
++		return -EBUSY;
++
+ 	*scanned += bo->ttm->num_pages;
+ 	lret = ttm_bo_shrink(ctx, bo, (struct ttm_bo_shrink_flags)
+ 			     {.purge = true,
+@@ -1406,11 +1422,18 @@ long xe_bo_shrink(struct ttm_operation_ctx *ctx, struct ttm_buffer_object *bo,
+ 	if (needs_rpm && !xe_pm_runtime_get_if_active(xe))
+ 		goto out_unref;
+ 
++	/* Rejected before any shrinking started: the walk skips this BO. */
++	if (xe_tt_ensure_backup(tt)) {
++		lret = -EBUSY;
++		goto out_rpm;
++	}
++
+ 	*scanned += tt->num_pages;
+ 	lret = ttm_bo_shrink(ctx, bo, (struct ttm_bo_shrink_flags)
+ 			     {.purge = false,
+ 			      .writeback = flags.writeback,
+ 			      .allow_move = true});
++out_rpm:
+ 	if (needs_rpm)
+ 		xe_pm_runtime_put(xe);
+ 
+-- 
+2.55.0
+

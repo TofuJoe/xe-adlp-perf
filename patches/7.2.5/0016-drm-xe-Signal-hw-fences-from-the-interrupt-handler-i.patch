@@ -1,7 +1,7 @@
 From c04b568561d70949f7e97391e07da0df75904ef7 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Mon, 14 Sep 2026 23:01:49 -0600
-Subject: [PATCH 16/22] drm/xe: Signal hw fences from the interrupt handler
+Subject: [PATCH 16/32] drm/xe: Signal hw fences from the interrupt handler
  instead of irq_work
 
 Every engine user interrupt queued the fence irq_work, which on x86 raises

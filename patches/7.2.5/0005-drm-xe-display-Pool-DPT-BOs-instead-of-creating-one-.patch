@@ -1,7 +1,7 @@
 From 1763e531faf33af659e6321d394d3d5ee1170d94 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Mon, 14 Sep 2026 16:21:11 -0700
-Subject: [PATCH 05/22] drm/xe/display: Pool DPT BOs instead of creating one
+Subject: [PATCH 05/32] drm/xe/display: Pool DPT BOs instead of creating one
  per page flip
 
 Every flip of a DPT framebuffer created a new DPT BO and destroyed the

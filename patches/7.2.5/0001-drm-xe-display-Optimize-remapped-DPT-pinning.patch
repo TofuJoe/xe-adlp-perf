@@ -1,7 +1,7 @@
 From 89efa99734342da91f4b22f6f046973efc0f88f0 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Mon, 14 Sep 2026 09:01:12 -0700
-Subject: [PATCH 01/22] drm/xe/display: Optimize remapped DPT pinning
+Subject: [PATCH 01/32] drm/xe/display: Optimize remapped DPT pinning
 
 Remapped framebuffer views (used on ADL-P for large framebuffers) filled the
 display page table with one xe_bo_addr() call per page, and each call

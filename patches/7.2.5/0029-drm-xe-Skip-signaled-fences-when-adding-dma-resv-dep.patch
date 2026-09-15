@@ -1,0 +1,83 @@
+From ec534ac85d5c6e55ab0be83b632624fa78b27140 Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Tue, 15 Sep 2026 10:30:07 -0700
+Subject: [PATCH 29/32] drm/xe: Skip signaled fences when adding dma-resv
+ dependencies to a job
+
+xe_sched_job_add_deps() forwarded to drm_sched_job_add_resv_dependencies(),
+which adds every fence of the requested usage class, signaled or not. An
+exec locks the VM and all of its external BOs (about 9 per exec on a plain
+GL client, ~40 for the compositor) and adds their KERNEL fences, which are
+almost always long signaled. Each one costs an O(deps) context dedup scan
+and an xarray slot in drm_sched_job_add_dependency(), and later an xa_load
+plus a failed dma_fence_add_callback() when the scheduler pops the job.
+The profile showed ~9 dependencies per job with ~6 syncs, and the xarray
+walk in drm_sched_job_cleanup() as the top item of the free_job worker.
+
+Iterate the resv here and skip fences that have already signaled; a
+signaled dependency imposes no ordering. Callers in xe_exec.c, xe_pt.c and
+xe_migrate.c all hold the resv, as before.
+
+Assisted-by: Claude:claude-fable-5-1
+---
+ drivers/gpu/drm/xe/xe_sched_job.c | 36 ++++++++++++++++++++++++++++++-
+ 1 file changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_sched_job.c b/drivers/gpu/drm/xe/xe_sched_job.c
+index ae5b38b..d1d8eac 100644
+--- a/drivers/gpu/drm/xe/xe_sched_job.c
++++ b/drivers/gpu/drm/xe/xe_sched_job.c
+@@ -7,6 +7,7 @@
+ 
+ #include <uapi/drm/xe_drm.h>
+ #include <linux/dma-fence-chain.h>
++#include <linux/dma-resv.h>
+ #include <linux/slab.h>
+ 
+ #include "xe_device.h"
+@@ -353,8 +354,41 @@ xe_sched_job_snapshot_print(struct xe_sched_job_snapshot *snapshot,
+ 		drm_printf(p, "batch_addr[%u]: 0x%016llx\n", i, snapshot->batch_addr[i]);
+ }
+ 
++/**
++ * xe_sched_job_add_deps() - Add the fences of a dma-resv as job dependencies
++ * @job: The job
++ * @resv: The locked dma-resv to take fences from
++ * @usage: The dma-resv usage class to include
++ *
++ * Like drm_sched_job_add_resv_dependencies(), but fences that have already
++ * signaled are skipped. An exec locks every external BO of its VM, and their
++ * KERNEL slots mostly hold long-signaled fences; each one would otherwise
++ * cost an O(deps) dedup scan and an xarray allocation here, and another
++ * lookup plus a failed callback registration when the scheduler pops the job.
++ *
++ * Return: 0 on success, negative error code on failure.
++ */
+ int xe_sched_job_add_deps(struct xe_sched_job *job, struct dma_resv *resv,
+ 			  enum dma_resv_usage usage)
+ {
+-	return drm_sched_job_add_resv_dependencies(&job->drm, resv, usage);
++	struct dma_resv_iter cursor;
++	struct dma_fence *fence;
++	int ret;
++
++	dma_resv_assert_held(resv);
++
++	dma_resv_for_each_fence(&cursor, resv, usage, fence) {
++		if (dma_fence_is_signaled(fence))
++			continue;
++
++		/*
++		 * drm_sched_job_add_dependency() consumes the reference, even
++		 * on failure, and the iterator does not hold one for us.
++		 */
++		ret = drm_sched_job_add_dependency(&job->drm, dma_fence_get(fence));
++		if (ret)
++			return ret;
++	}
++
++	return 0;
+ }
+-- 
+2.55.0
+

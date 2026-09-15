@@ -1,7 +1,7 @@
 From 68934ae9b1e65d46f8fcb09e0eb3e705d7554dd5 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Mon, 14 Sep 2026 21:15:19 -0600
-Subject: [PATCH 14/22] drm/xe/display: Pool DSB buffers and skip unchanged DPT
+Subject: [PATCH 14/32] drm/xe/display: Pool DSB buffers and skip unchanged DPT
  rewrites
 
 On an external DP output each commit created and destroyed a DSB command

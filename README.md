@@ -73,11 +73,38 @@ app's next GPU submission swapped them straight back in.
 These two samples were taken at different times, not as a controlled A/B test. The remaining
 swap-outs happen inside apps that are themselves stalled waiting for memory (by design, see 0022).
 
+### GPU submission and per-frame bookkeeping (0023–0032 vs 0001–0022)
+
+Measured on the internal panel with `glxgears` at 60 fps on top of the normal desktop, ftrace
+function profile over 10 s (2026-09-15):
+
+| | Before | After |
+|---|---|---|
+| GPU submission (exec ioctl), average | 45 µs | 35 µs |
+| Locking the VM and its external buffers per exec | 11.3 µs | 5.5 µs |
+| Scheduler dependencies added per job | ~9 | 4.6 |
+| PSR frontbuffer flush per display commit | 12.9 µs | 4.9 µs |
+| `intel_encoder_can_psr` calls per commit | 28 | 7 |
+
+0027 (lazy shmem backup) and 0028 (fault prefault) only act under memory pressure and were not
+measured yet; 0023–0026 are upstream fixes.
+
+### A tip that is not a patch: the GPU frequency floor
+
+On this machine the firmware's "efficient" frequency is reported as 300 MHz, and with a desktop
+that keeps the GPU about 10% busy it simply stays there. Raising the floor halved the time each
+render job spends on the GPU (median 1.65 ms → 0.84 ms at 700 MHz) and *raised* RC6 idle residency
+from 76% to 87%, because jobs finish sooner:
+```
+echo 700 | sudo tee /sys/class/drm/card0/device/tile0/gt0/freq0/min_freq
+```
+Battery cost was not measurable with RAPL on a busy desktop. Undo with `echo 300`.
+
 ### Not individually measured
 
-Patches 0002–0004 (upstream fixes), 0006 (flip boost), 0007 (exec job allocation), 0008 (LRU
-refresh for long-running VMs), 0009 (user fence wake-ups) and 0010 (TLB invalidation coalescing)
-were not benchmarked on their own.
+Patches 0002–0004 and 0023–0026 (upstream fixes), 0006 (flip boost), 0007 (exec job allocation),
+0008 (LRU refresh for long-running VMs), 0009 (user fence wake-ups), 0010 (TLB invalidation
+coalescing), 0027 (lazy shmem backup) and 0028 (fault prefault) were not benchmarked on their own.
 
 ## Patches (`patches/7.2.5/`)
 
@@ -105,12 +132,23 @@ were not benchmarked on their own.
 | 0020 | Shrinker: only skip BOs that were not attempted | |
 | 0021 | Shrinker: leave BOs of actively rendering VMs alone (`xe.shrink_active_ms`) | |
 | 0022 | Shrinker: apply that only in kswapd and only to idle BOs, so no BO becomes unreclaimable | |
+| 0023 | pcode mailbox timeout 1 → 10 ms (spurious `-ETIMEDOUT` under load) | Karthik Poosa, drm-xe-next, hand-ported |
+| 0024 | Revert "Clear SEL_FETCH_PLANE_CTL on plane disable" (writes to pipes without selective fetch) | Nemesa Garg, drm-intel-next, Cc stable |
+| 0025 | PSR: clear stale selective-fetch enable bits when selective fetch is turned off | Nemesa Garg, drm-intel-next |
+| 0026 | Engine-domain forcewake for engine cycle queries instead of waking all domains | Xin Wang, upstream 7.3-rc1 |
+| 0027 | Create the shmem backup file lazily in the shrinker, not for every BO at creation | |
+| 0028 | CPU fault prefault size tunable, default 512 pages (`xe.prefault_pages`) | |
+| 0029 | Skip already-signaled fences when adding dma-resv dependencies to a job | |
+| 0030 | Size the exec `drm_exec` object array from the previous lock instead of 4 KiB per exec | |
+| 0031 | PSR: frontbuffer flush/invalidate only visit encoders whose PSR is enabled | |
+| 0032 | ADDFB2: don't reserve the BO when the write-combine flag is already set | |
 
 Patches without an origin were written for this series with AI assistance (Claude; marked
-`Assisted-by:` in each commit). Patches 0005–0022 were checked by independent review passes before
-being booted, but none of it has been reviewed by kernel maintainers or run through Intel's IGT suite.
-0006, 0010, 0016 and 0018–0022 touch GPU frequency control, TLB invalidation, interrupt handling
-and memory reclaim, where a bug can mean hangs or corruption rather than a slow frame.
+`Assisted-by:` in each commit). Patches 0005–0022 and 0027–0032 were checked by independent review
+passes before being booted, but none of it has been reviewed by kernel maintainers or run through
+Intel's IGT suite. 0006, 0010, 0016, 0018–0022 and 0027 touch GPU frequency control, TLB
+invalidation, interrupt handling and memory reclaim, where a bug can mean hangs or corruption
+rather than a slow frame.
 
 ## Requirements
 
@@ -165,11 +203,12 @@ when that happens.
 
 Undo completely: `sudo ./revert.sh <kernel-version>` and reboot.
 
-Three changes can be switched off at runtime (as root):
+Four changes can be switched off at runtime (as root):
 ```
 echo 0 > /sys/module/xe/parameters/flip_boost          # 0006
 echo 0 > /sys/module/xe/parameters/tlb_inval_coalesce  # 0010
 echo 0 > /sys/module/xe/parameters/shrink_active_ms    # 0021/0022
+echo 0 > /sys/module/xe/parameters/prefault_pages      # 0028: back to TTM's 16 pages per fault
 ```
 or permanently with `xe.flip_boost=0` and so on on the kernel command line.
 

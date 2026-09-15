@@ -1,7 +1,7 @@
 From 6edba906adae57d0ece1fc0327fd1e689f4df45f Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Mon, 14 Sep 2026 10:33:26 -0700
-Subject: [PATCH 04/22] drm/xe/guc: Fix race around q->guc->suspend_pending
+Subject: [PATCH 04/32] drm/xe/guc: Fix race around q->guc->suspend_pending
  access
 
 Original author: Jagmeet Randhawa (intel-xe list; address redacted in the

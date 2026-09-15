@@ -1,7 +1,7 @@
 From e68b7ab47c9f1dca7ab742fb4ce5bec57c023f6d Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Tue, 15 Sep 2026 07:46:30 -0600
-Subject: [PATCH 21/22] drm/xe/shrinker: Leave BOs of actively used VMs alone
+Subject: [PATCH 21/32] drm/xe/shrinker: Leave BOs of actively used VMs alone
 
 Every exec restores all evicted BOs bound in its VM before running
 (xe_vm_validate_rebind), but the shrinker did not consider whether a VM was

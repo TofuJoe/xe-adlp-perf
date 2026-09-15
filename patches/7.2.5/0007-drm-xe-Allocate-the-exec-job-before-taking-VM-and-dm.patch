@@ -1,7 +1,7 @@
 From 1cdd501b23f7d94941628b233d778ffd31accfd1 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Mon, 14 Sep 2026 16:25:17 -0700
-Subject: [PATCH 07/22] drm/xe: Allocate the exec job before taking VM and
+Subject: [PATCH 07/32] drm/xe: Allocate the exec job before taking VM and
  dma-resv locks
 
 xe_exec_ioctl() allocated the scheduler job only after locking the VM, the
