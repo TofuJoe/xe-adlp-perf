@@ -1,0 +1,177 @@
+From c04b568561d70949f7e97391e07da0df75904ef7 Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Mon, 14 Sep 2026 23:01:49 -0600
+Subject: [PATCH 16/22] drm/xe: Signal hw fences from the interrupt handler
+ instead of irq_work
+
+Every engine user interrupt queued the fence irq_work, which on x86 raises
+a self-IPI to run hw_fence_irq_run_cb in hard IRQ context right after the xe
+handler returns: one extra interrupt per job completion (~210/s measured at
+60 fps on ADL-P).
+
+gt_irq_handler() now collects the fence irqs hit and runs the callback
+directly once xe->irq.lock is dropped. irq_work is still used on PREEMPT_RT,
+outside hard IRQ context (forced irq threading), for memirq, and for the
+process-context kicks.
+
+Assisted-by: Claude:claude-opus-5
+---
+ drivers/gpu/drm/xe/xe_hw_engine.c | 20 +++++++++++++++++---
+ drivers/gpu/drm/xe/xe_hw_engine.h |  2 ++
+ drivers/gpu/drm/xe/xe_hw_fence.c  | 18 ++++++++++++++++++
+ drivers/gpu/drm/xe/xe_hw_fence.h  |  1 +
+ drivers/gpu/drm/xe/xe_irq.c       | 25 ++++++++++++++++++++++++-
+ 5 files changed, 62 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_hw_engine.c b/drivers/gpu/drm/xe/xe_hw_engine.c
+index 038a018..4e83c89 100644
+--- a/drivers/gpu/drm/xe/xe_hw_engine.c
++++ b/drivers/gpu/drm/xe/xe_hw_engine.c
+@@ -894,7 +894,14 @@ int xe_hw_engines_init(struct xe_gt *gt)
+ 	return 0;
+ }
+ 
+-void xe_hw_engine_handle_irq(struct xe_hw_engine *hwe, u16 intr_vec)
++/**
++ * __xe_hw_engine_handle_irq() - Handle an engine interrupt, except fence signalling
++ * @hwe: The engine
++ * @intr_vec: Interrupt vector bits
++ *
++ * Return: the fence irq the caller must run (after dropping its locks), or NULL.
++ */
++struct xe_hw_fence_irq *__xe_hw_engine_handle_irq(struct xe_hw_engine *hwe, u16 intr_vec)
+ {
+ 	struct wait_queue_head *ufence_wq = &gt_to_xe(hwe->gt)->ufence_wq;
+ 
+@@ -911,8 +918,15 @@ void xe_hw_engine_handle_irq(struct xe_hw_engine *hwe, u16 intr_vec)
+ 	if (hwe->irq_handler)
+ 		hwe->irq_handler(hwe, intr_vec);
+ 
+-	if (intr_vec & GT_MI_USER_INTERRUPT)
+-		xe_hw_fence_irq_run(hwe->fence_irq);
++	return (intr_vec & GT_MI_USER_INTERRUPT) ? hwe->fence_irq : NULL;
++}
++
++void xe_hw_engine_handle_irq(struct xe_hw_engine *hwe, u16 intr_vec)
++{
++	struct xe_hw_fence_irq *fence_irq = __xe_hw_engine_handle_irq(hwe, intr_vec);
++
++	if (fence_irq)
++		xe_hw_fence_irq_run(fence_irq);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/xe/xe_hw_engine.h b/drivers/gpu/drm/xe/xe_hw_engine.h
+index c3ee37f..5058d82 100644
+--- a/drivers/gpu/drm/xe/xe_hw_engine.h
++++ b/drivers/gpu/drm/xe/xe_hw_engine.h
+@@ -51,6 +51,8 @@ struct xe_exec_queue;
+ 
+ int xe_hw_engines_init_early(struct xe_gt *gt);
+ int xe_hw_engines_init(struct xe_gt *gt);
++struct xe_hw_fence_irq;
++struct xe_hw_fence_irq *__xe_hw_engine_handle_irq(struct xe_hw_engine *hwe, u16 intr_vec);
+ void xe_hw_engine_handle_irq(struct xe_hw_engine *hwe, u16 intr_vec);
+ void xe_hw_engine_enable_ring(struct xe_hw_engine *hwe);
+ u32 xe_hw_engine_mask_per_class(struct xe_gt *gt,
+diff --git a/drivers/gpu/drm/xe/xe_hw_fence.c b/drivers/gpu/drm/xe/xe_hw_fence.c
+index 1472062..fb962ee 100644
+--- a/drivers/gpu/drm/xe/xe_hw_fence.c
++++ b/drivers/gpu/drm/xe/xe_hw_fence.c
+@@ -106,6 +106,24 @@ void xe_hw_fence_irq_run(struct xe_hw_fence_irq *irq)
+ 	irq_work_queue(&irq->work);
+ }
+ 
++/**
++ * xe_hw_fence_irq_run_now() - Signal completed hw fences from the device IRQ
++ * @irq: The fence irq
++ *
++ * When called from the hard interrupt handler, the irq_work would only raise a
++ * self-IPI to run the same callback in the same context right afterwards, so
++ * run it directly. Callers must not hold locks the fence callbacks could take.
++ * Falls back to irq_work on PREEMPT_RT and outside hard IRQ context (e.g. with
++ * forced interrupt threading).
++ */
++void xe_hw_fence_irq_run_now(struct xe_hw_fence_irq *irq)
++{
++	if (!IS_ENABLED(CONFIG_PREEMPT_RT) && in_hardirq())
++		hw_fence_irq_run_cb(&irq->work);
++	else
++		irq_work_queue(&irq->work);
++}
++
+ void xe_hw_fence_ctx_init(struct xe_hw_fence_ctx *ctx, struct xe_gt *gt,
+ 			  struct xe_hw_fence_irq *irq, const char *name)
+ {
+diff --git a/drivers/gpu/drm/xe/xe_hw_fence.h b/drivers/gpu/drm/xe/xe_hw_fence.h
+index 599492c..8618d1f 100644
+--- a/drivers/gpu/drm/xe/xe_hw_fence.h
++++ b/drivers/gpu/drm/xe/xe_hw_fence.h
+@@ -17,6 +17,7 @@ void xe_hw_fence_module_exit(void);
+ void xe_hw_fence_irq_init(struct xe_hw_fence_irq *irq);
+ void xe_hw_fence_irq_finish(struct xe_hw_fence_irq *irq);
+ void xe_hw_fence_irq_run(struct xe_hw_fence_irq *irq);
++void xe_hw_fence_irq_run_now(struct xe_hw_fence_irq *irq);
+ 
+ void xe_hw_fence_ctx_init(struct xe_hw_fence_ctx *ctx, struct xe_gt *gt,
+ 			  struct xe_hw_fence_irq *irq, const char *name);
+diff --git a/drivers/gpu/drm/xe/xe_irq.c b/drivers/gpu/drm/xe/xe_irq.c
+index 9e49e22..19fe982 100644
+--- a/drivers/gpu/drm/xe/xe_irq.c
++++ b/drivers/gpu/drm/xe/xe_irq.c
+@@ -17,6 +17,7 @@
+ #include "xe_gt.h"
+ #include "xe_guc.h"
+ #include "xe_hw_engine.h"
++#include "xe_hw_fence.h"
+ #include "xe_hw_error.h"
+ #include "xe_i2c.h"
+ #include "xe_memirq.h"
+@@ -360,6 +361,9 @@ static void gt_irq_handler(struct xe_tile *tile,
+ 	u16 instance, intr_vec;
+ 	enum xe_engine_class class;
+ 	struct xe_hw_engine *hwe;
++	/* One fence irq per engine class per GT at most. */
++	struct xe_hw_fence_irq *fence_irqs[XE_ENGINE_CLASS_MAX * XE_MAX_GT_PER_TILE];
++	unsigned int num_fence_irqs = 0, i;
+ 
+ 	spin_lock(&xe->irq.lock);
+ 
+@@ -383,7 +387,18 @@ static void gt_irq_handler(struct xe_tile *tile,
+ 
+ 			hwe = xe_gt_hw_engine(engine_gt, class, instance, false);
+ 			if (hwe) {
+-				xe_hw_engine_handle_irq(hwe, intr_vec);
++				struct xe_hw_fence_irq *fence_irq =
++					__xe_hw_engine_handle_irq(hwe, intr_vec);
++
++				if (!fence_irq)
++					continue;
++
++				for (i = 0; i < num_fence_irqs; i++)
++					if (fence_irqs[i] == fence_irq)
++						break;
++				if (i == num_fence_irqs &&
++				    !WARN_ON_ONCE(i == ARRAY_SIZE(fence_irqs)))
++					fence_irqs[num_fence_irqs++] = fence_irq;
+ 				continue;
+ 			}
+ 
+@@ -404,6 +419,14 @@ static void gt_irq_handler(struct xe_tile *tile,
+ 	}
+ 
+ 	spin_unlock(&xe->irq.lock);
++
++	/*
++	 * Signal completed jobs here rather than through irq_work, which would
++	 * cost a self-IPI per interrupt to run the same code right afterwards.
++	 * Done outside xe->irq.lock, which fence callbacks must not nest under.
++	 */
++	for (i = 0; i < num_fence_irqs; i++)
++		xe_hw_fence_irq_run_now(fence_irqs[i]);
+ }
+ 
+ /*
+-- 
+2.55.0
+

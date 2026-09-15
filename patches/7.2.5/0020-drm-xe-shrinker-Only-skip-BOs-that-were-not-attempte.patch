@@ -1,0 +1,120 @@
+From 4d12fb9db23a009e87dd3c196c3f08f5d585591c Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Mon, 14 Sep 2026 23:15:59 -0600
+Subject: [PATCH 20/22] drm/xe/shrinker: Only skip BOs that were not attempted
+
+Follow-up to "Skip busy BOs and keep freed pages on error" (review):
+ttm_bo_shrink() maps backup and validate failures (swap full, -ENOMEM,
+-ENOSPC) to -EBUSY after the BO has already been moved to system memory and
+unbound. Skipping on those would evict up to 256 BOs per pass, and up to
+three passes, without freeing anything.
+
+Skip only when xe_bo_shrink() returned -EBUSY before accounting the BO as
+scanned; any failure after that stops the walk and its remaining passes,
+still reporting pages already freed. Also honour to_scan on the skip path.
+
+Assisted-by: Claude:claude-opus-5
+---
+ drivers/gpu/drm/xe/xe_shrinker.c | 42 +++++++++++++++++++++++---------
+ 1 file changed, 30 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_shrinker.c b/drivers/gpu/drm/xe/xe_shrinker.c
+index b5b5ea4..b8aa942 100644
+--- a/drivers/gpu/drm/xe/xe_shrinker.c
++++ b/drivers/gpu/drm/xe/xe_shrinker.c
+@@ -56,15 +56,22 @@ xe_shrinker_mod_pages(struct xe_shrinker *shrinker, long shrinkable, long purgea
+ 
+ /*
+  * How many BOs in a row a walk may skip because they can't be shrunk right now
+- * (-EBUSY: not purgeable in a purge pass, not eviction-valuable, VM busy)
++ * (not purgeable in a purge pass, not eviction-valuable, idle-wait failed)
+  * before giving up. Bounds the walk cost when the LRU head is full of them.
+  */
+ #define XE_SHRINK_MAX_BUSY_SKIPS 256
+ 
++/*
++ * Returns the pages freed, or a negative error if nothing was freed. *@stop is
++ * set when a BO failed after shrinking had started on it (e.g. backup failed
++ * because swap is full), in which case further walks would only evict more
++ * BOs without freeing memory.
++ */
+ static s64 __xe_shrinker_walk(struct xe_device *xe,
+ 			      struct ttm_operation_ctx *ctx,
+ 			      const struct xe_bo_shrink_flags flags,
+-			      unsigned long to_scan, unsigned long *scanned)
++			      unsigned long to_scan, unsigned long *scanned,
++			      bool *stop)
+ {
+ 	unsigned int mem_type, busy = 0;
+ 	s64 freed = 0, lret;
+@@ -85,16 +92,27 @@ static s64 __xe_shrinker_walk(struct xe_device *xe,
+ 			if (!ttm_bo_shrink_suitable(ttm_bo, ctx))
+ 				continue;
+ 
++			unsigned long scanned_before = *scanned;
++
+ 			lret = xe_bo_shrink(ctx, ttm_bo, flags, scanned);
+-			if (lret == -EBUSY) {
+-				/* This BO can't be shrunk now; others may. */
+-				if (++busy >= XE_SHRINK_MAX_BUSY_SKIPS)
++			/*
++			 * xe_bo_shrink() accounts a BO as scanned only once it
++			 * starts shrinking it. -EBUSY before that means "skip
++			 * this BO"; after it (ttm_bo_shrink() maps backup and
++			 * validate failures to -EBUSY) the BO may already have
++			 * been unbound, so stop instead of repeating that.
++			 */
++			if (lret == -EBUSY && *scanned == scanned_before) {
++				if (++busy >= XE_SHRINK_MAX_BUSY_SKIPS ||
++				    *scanned >= to_scan)
+ 					return freed;
+ 				continue;
+ 			}
+-			if (lret < 0)
++			if (lret < 0) {
++				*stop = true;
+ 				/* Don't discard pages already freed by this walk. */
+ 				return freed ?: lret;
++			}
+ 
+ 			busy = 0;
+ 			freed += lret;
+@@ -119,29 +137,29 @@ static s64 xe_shrinker_walk(struct xe_device *xe,
+ 			    const struct xe_bo_shrink_flags flags,
+ 			    unsigned long to_scan, unsigned long *scanned)
+ {
+-	bool no_wait_gpu = true;
++	bool no_wait_gpu = true, stop = false;
+ 	struct xe_bo_shrink_flags save_flags = flags;
+ 	s64 lret, freed;
+ 
+ 	swap(no_wait_gpu, ctx->no_wait_gpu);
+ 	save_flags.writeback = false;
+-	lret = __xe_shrinker_walk(xe, ctx, save_flags, to_scan, scanned);
++	lret = __xe_shrinker_walk(xe, ctx, save_flags, to_scan, scanned, &stop);
+ 	swap(no_wait_gpu, ctx->no_wait_gpu);
+-	if (lret < 0 || *scanned >= to_scan)
++	if (lret < 0 || stop || *scanned >= to_scan)
+ 		return lret;
+ 
+ 	freed = lret;
+ 	if (!ctx->no_wait_gpu) {
+-		lret = __xe_shrinker_walk(xe, ctx, save_flags, to_scan, scanned);
++		lret = __xe_shrinker_walk(xe, ctx, save_flags, to_scan, scanned, &stop);
+ 		if (lret < 0)
+ 			return freed ?: lret;
+ 		freed += lret;
+-		if (*scanned >= to_scan)
++		if (stop || *scanned >= to_scan)
+ 			return freed;
+ 	}
+ 
+ 	if (flags.writeback) {
+-		lret = __xe_shrinker_walk(xe, ctx, flags, to_scan, scanned);
++		lret = __xe_shrinker_walk(xe, ctx, flags, to_scan, scanned, &stop);
+ 		if (lret < 0)
+ 			return freed ?: lret;
+ 		freed += lret;
+-- 
+2.55.0
+

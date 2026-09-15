@@ -1,0 +1,153 @@
+From 4f4f1f3282676ddf50d8e7faa38e299cff4c021a Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Mon, 14 Sep 2026 23:01:49 -0600
+Subject: [PATCH 19/22] drm/i915/display: Cache per-format plane capability
+ scans for fb creation
+
+intel_framebuffer_init() and intel_fill_fb_info() scan every plane's format
+list for drm_any_plane_has_format(), the fb min_alignment and the vtd guard
+on every framebuffer creation. These only depend on (format, modifier) and
+on plane capabilities, which are fixed after probe. Compositors that create
+a framebuffer per frame paid this each frame.
+
+Cache the results in a small per-device table.
+
+Assisted-by: Claude:claude-opus-5
+---
+ .../gpu/drm/i915/display/intel_display_core.h | 19 ++++++
+ .../drm/i915/display/intel_display_driver.c   |  1 +
+ drivers/gpu/drm/i915/display/intel_fb.c       | 62 ++++++++++++++++++-
+ 3 files changed, 79 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_core.h b/drivers/gpu/drm/i915/display/intel_display_core.h
+index 09ce25a..d7c45cc 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_core.h
++++ b/drivers/gpu/drm/i915/display/intel_display_core.h
+@@ -631,6 +631,25 @@ struct intel_display {
+ 		struct workqueue_struct *unordered;
+ 	} wq;
+ 
++	/*
++	 * Per (format, modifier) results of the plane capability scans done on
++	 * every framebuffer creation, which only depend on those two values.
++	 * An entry exists only after a framebuffer with that format and
++	 * modifier passed the "any plane supports it" check.
++	 */
++	struct {
++		spinlock_t lock;
++#define INTEL_FB_CAPS_CACHE_SIZE 8
++		struct {
++			u32 format;
++			u64 modifier;
++			unsigned int min_alignment;
++			unsigned int vtd_guard;
++			bool valid;
++		} entry[INTEL_FB_CAPS_CACHE_SIZE];
++		unsigned int next;
++	} fb_caps;
++
+ 	/* Grouping using named structs. Keep sorted. */
+ 	struct drm_dp_tunnel_mgr *dp_tunnel_mgr;
+ 	struct intel_audio audio;
+diff --git a/drivers/gpu/drm/i915/display/intel_display_driver.c b/drivers/gpu/drm/i915/display/intel_display_driver.c
+index d072993..022cdb3 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_driver.c
++++ b/drivers/gpu/drm/i915/display/intel_display_driver.c
+@@ -178,6 +178,7 @@ void intel_display_driver_early_probe(struct intel_display *display)
+ 		return;
+ 
+ 	spin_lock_init(&display->fb_tracking.lock);
++	spin_lock_init(&display->fb_caps.lock);
+ 	mutex_init(&display->backlight.lock);
+ 	mutex_init(&display->audio.mutex);
+ 	mutex_init(&display->wm.wm_mutex);
+diff --git a/drivers/gpu/drm/i915/display/intel_fb.c b/drivers/gpu/drm/i915/display/intel_fb.c
+index 1c0859d..5059a07 100644
+--- a/drivers/gpu/drm/i915/display/intel_fb.c
++++ b/drivers/gpu/drm/i915/display/intel_fb.c
+@@ -1696,6 +1696,48 @@ static unsigned int intel_fb_vtd_guard(const struct drm_framebuffer *fb)
+ 	return vtd_guard;
+ }
+ 
++static bool intel_fb_caps_lookup(struct intel_display *display, u32 format,
++				 u64 modifier, unsigned int *min_alignment,
++				 unsigned int *vtd_guard)
++{
++	bool found = false;
++	int i;
++
++	spin_lock(&display->fb_caps.lock);
++	for (i = 0; i < INTEL_FB_CAPS_CACHE_SIZE; i++) {
++		if (display->fb_caps.entry[i].valid &&
++		    display->fb_caps.entry[i].format == format &&
++		    display->fb_caps.entry[i].modifier == modifier) {
++			if (min_alignment)
++				*min_alignment = display->fb_caps.entry[i].min_alignment;
++			if (vtd_guard)
++				*vtd_guard = display->fb_caps.entry[i].vtd_guard;
++			found = true;
++			break;
++		}
++	}
++	spin_unlock(&display->fb_caps.lock);
++
++	return found;
++}
++
++static void intel_fb_caps_store(struct intel_display *display, u32 format,
++				u64 modifier, unsigned int min_alignment,
++				unsigned int vtd_guard)
++{
++	unsigned int i;
++
++	spin_lock(&display->fb_caps.lock);
++	i = display->fb_caps.next;
++	display->fb_caps.next = (i + 1) % INTEL_FB_CAPS_CACHE_SIZE;
++	display->fb_caps.entry[i].format = format;
++	display->fb_caps.entry[i].modifier = modifier;
++	display->fb_caps.entry[i].min_alignment = min_alignment;
++	display->fb_caps.entry[i].vtd_guard = vtd_guard;
++	display->fb_caps.entry[i].valid = true;
++	spin_unlock(&display->fb_caps.lock);
++}
++
+ int intel_fill_fb_info(struct intel_display *display, struct intel_framebuffer *fb)
+ {
+ 	struct drm_gem_object *obj = intel_fb_bo(&fb->base);
+@@ -1795,8 +1837,19 @@ int intel_fill_fb_info(struct intel_display *display, struct intel_framebuffer *
+ 		return -EINVAL;
+ 	}
+ 
+-	fb->min_alignment = intel_fb_min_alignment(&fb->base);
+-	fb->vtd_guard = intel_fb_vtd_guard(&fb->base);
++	/*
++	 * Both only depend on (format, modifier) and on which planes support
++	 * them, which never changes after probe, but scan every plane.
++	 */
++	if (!intel_fb_caps_lookup(display, fb->base.format->format,
++				  fb->base.modifier, &fb->min_alignment,
++				  &fb->vtd_guard)) {
++		fb->min_alignment = intel_fb_min_alignment(&fb->base);
++		fb->vtd_guard = intel_fb_vtd_guard(&fb->base);
++		intel_fb_caps_store(display, fb->base.format->format,
++				    fb->base.modifier, fb->min_alignment,
++				    fb->vtd_guard);
++	}
+ 
+ 	return 0;
+ }
+@@ -2238,7 +2291,10 @@ int intel_framebuffer_init(struct intel_framebuffer *intel_fb,
+ 	if (ret)
+ 		goto err_frontbuffer_put;
+ 
+-	if (!drm_any_plane_has_format(display->drm,
++	/* A cache entry means an earlier fb with this format passed this check. */
++	if (!intel_fb_caps_lookup(display, mode_cmd->pixel_format,
++				  mode_cmd->modifier[0], NULL, NULL) &&
++	    !drm_any_plane_has_format(display->drm,
+ 				      mode_cmd->pixel_format,
+ 				      mode_cmd->modifier[0])) {
+ 		drm_dbg_kms(display->drm,
+-- 
+2.55.0
+

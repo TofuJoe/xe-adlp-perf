@@ -1,0 +1,298 @@
+From 9715ff20d382167c9a7946ee038175e45296eb3b Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Mon, 14 Sep 2026 16:51:21 -0700
+Subject: [PATCH 11/22] drm/xe: Harden flip boost and TLB invalidation send
+ errors
+
+Follow-up to the flip boost and TLB coalescing commits, from review:
+
+flip boost:
+- only queue the works once xe_guc_pc_init() initialized them; GuC PC is
+  never initialized with execlists or as a VF, but display still probes;
+- never wake a suspended device to boost; do take a runtime PM ref to
+  unboost, since without d3cold GuC keeps SLPC state across runtime suspend;
+- cap the boost at the live SLPC max, skip it while the L2 flush frequency
+  limit applies, on WA 22019338487 platforms, and on wedged devices;
+- restore by unsetting the GuC min params when no user min is set, instead
+  of pinning the previously reported value;
+- clear the boost when SLPC restarts (GT reset, resume), and bound the
+  unboost retries on -EAGAIN instead of re-arming forever.
+
+TLB invalidation: on a send error only signal the fence if it is still
+pending; the TDR may already have signalled it while the send was blocked.
+This also fixes the same pattern in xe_tlb_inval_issue().
+
+Assisted-by: Claude:claude-opus-5
+---
+ drivers/gpu/drm/xe/xe_guc_pc.c       | 123 +++++++++++++++++++--------
+ drivers/gpu/drm/xe/xe_guc_pc_types.h |   4 +
+ drivers/gpu/drm/xe/xe_tlb_inval.c    |  30 +++++--
+ 3 files changed, 117 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_guc_pc.c b/drivers/gpu/drm/xe/xe_guc_pc.c
+index 75b3771..fe7cb62 100644
+--- a/drivers/gpu/drm/xe/xe_guc_pc.c
++++ b/drivers/gpu/drm/xe/xe_guc_pc.c
+@@ -1149,6 +1149,8 @@ static int pc_init_freqs(struct xe_guc_pc *pc)
+ 	 * requested ones got restored.
+ 	 */
+ 	pc->freq_ready = true;
++	/* SLPC was (re)started with default or user frequencies: no boost. */
++	pc->boosted = false;
+ 
+ out:
+ 	mutex_unlock(&pc->freq_lock);
+@@ -1344,76 +1346,125 @@ void xe_guc_pc_stop(struct xe_guc_pc *pc)
+  * Raise the min freq to the max allowed freq and drop it again once no flip
+  * has missed for XE_GUC_PC_BOOST_HOLD_MS.
+  */
+-#define XE_GUC_PC_BOOST_HOLD_MS	100
++#define XE_GUC_PC_BOOST_HOLD_MS		100
++#define XE_GUC_PC_UNBOOST_RETRY_MS	1000
++#define XE_GUC_PC_UNBOOST_MAX_RETRIES	10
++
++static bool pc_boost_allowed(struct xe_guc_pc *pc)
++{
++	return READ_ONCE(pc->boost_ready) &&
++		READ_ONCE(xe_modparam.flip_boost) &&
++		READ_ONCE(pc->power_profile) != SLPC_POWER_PROFILE_POWER_SAVING &&
++		/* Frequency caps from this WA must not be overridden by a min. */
++		!XE_GT_WA(pc_to_gt(pc), 22019338487) &&
++		!xe_device_wedged(pc_to_xe(pc));
++}
+ 
+ static void xe_guc_pc_boost_work(struct work_struct *w)
+ {
+ 	struct xe_guc_pc *pc = container_of(w, struct xe_guc_pc, boost_work);
++	struct xe_device *xe = pc_to_xe(pc);
++	bool arm = false;
+ 	u32 cur_min, target;
+ 
+-	scoped_guard(mutex, &pc->freq_lock) {
+-		if (!pc->freq_ready)
+-			return;
++	/* Never wake a suspended GPU just to boost it. */
++	if (!pc_boost_allowed(pc) || !xe_pm_runtime_get_if_active(xe))
++		return;
+ 
+-		if (!pc->boosted) {
+-			target = pc->user_requested_max ?
+-				 min(pc->rp0_freq, pc->user_requested_max) :
+-				 pc->rp0_freq;
++	mutex_lock(&pc->freq_lock);
+ 
+-			if (xe_guc_pc_get_min_freq_locked(pc, &cur_min))
+-				return;
+-			if (cur_min >= target)
+-				return;
+-			if (pc_set_min_freq(pc, target))
+-				return;
++	if (!pc->freq_ready || atomic_read(&pc->flush_freq_limit))
++		goto unlock;
+ 
+-			pc->boost_saved_min = cur_min;
+-			pc->boosted = true;
+-		}
++	if (pc->boosted) {
++		arm = true;
++		goto unlock;
+ 	}
+ 
+-	mod_delayed_work(system_unbound_wq, &pc->unboost_work,
+-			 msecs_to_jiffies(XE_GUC_PC_BOOST_HOLD_MS));
++	/* Also refreshes the shared data read by pc_get_max_freq(). */
++	if (xe_guc_pc_get_min_freq_locked(pc, &cur_min))
++		goto unlock;
++
++	target = min_t(u32, pc->rp0_freq, pc_get_max_freq(pc));
++	if (cur_min >= target || pc_set_min_freq(pc, target))
++		goto unlock;
++
++	pc->boost_saved_min = cur_min;
++	pc->boost_retries = 0;
++	pc->boosted = true;
++	arm = true;
++
++unlock:
++	mutex_unlock(&pc->freq_lock);
++	if (arm)
++		mod_delayed_work(system_unbound_wq, &pc->unboost_work,
++				 msecs_to_jiffies(XE_GUC_PC_BOOST_HOLD_MS));
++	xe_pm_runtime_put(xe);
+ }
+ 
+ static void xe_guc_pc_unboost_work(struct work_struct *w)
+ {
+ 	struct xe_guc_pc *pc = container_of(to_delayed_work(w),
+ 					    struct xe_guc_pc, unboost_work);
++	struct xe_device *xe = pc_to_xe(pc);
++	int ret;
++
++	if (!READ_ONCE(pc->boosted))
++		return;
+ 
++	if (xe_device_wedged(xe)) {
++		/* GuC is gone; recovery reloads it with default frequencies. */
++		guard(mutex)(&pc->freq_lock);
++		pc->boosted = false;
++		return;
++	}
++
++	/*
++	 * Without d3cold, GuC keeps its SLPC state across runtime suspend, so a
++	 * raised min would outlive it: wake the device once to restore it.
++	 */
++	guard(xe_pm_runtime)(xe);
+ 	guard(mutex)(&pc->freq_lock);
+ 
+-	if (!pc->boosted)
++	/*
++	 * Not boosted any more, or SLPC is being restarted (GT reset, system
++	 * suspend), in which case pc_init_freqs() clears the boost.
++	 */
++	if (!pc->boosted || !pc->freq_ready)
+ 		return;
+ 
+-	/* GuC not running (reset/suspend): try again once it is back. */
+-	if (!pc->freq_ready) {
++	if (pc->user_requested_min) {
++		ret = pc_set_min_freq(pc, pc->user_requested_min);
++	} else if (pc_needs_min_freq_change(pc)) {
++		ret = pc_set_min_freq(pc, pc->boost_saved_min);
++	} else {
++		/* Give min back to SLPC's own policy rather than pinning a value. */
++		ret = pc_action_unset_param(pc, SLPC_PARAM_GLOBAL_MIN_GT_UNSLICE_FREQ_MHZ);
++		if (!ret)
++			ret = pc_action_unset_param(pc,
++						    SLPC_PARAM_IGNORE_EFFICIENT_FREQUENCY);
++	}
++
++	if (ret == -EAGAIN && ++pc->boost_retries <= XE_GUC_PC_UNBOOST_MAX_RETRIES) {
+ 		mod_delayed_work(system_unbound_wq, &pc->unboost_work,
+-				 msecs_to_jiffies(XE_GUC_PC_BOOST_HOLD_MS));
++				 msecs_to_jiffies(XE_GUC_PC_UNBOOST_RETRY_MS));
+ 		return;
+ 	}
+ 
+-	if (!pc_set_min_freq(pc, pc->user_requested_min ?: pc->boost_saved_min))
+-		pc->boosted = false;
+-	else
+-		mod_delayed_work(system_unbound_wq, &pc->unboost_work,
+-				 msecs_to_jiffies(XE_GUC_PC_BOOST_HOLD_MS));
++	/* Done, or a non-transient error (already logged): stop trying. */
++	pc->boosted = false;
+ }
+ 
+ /**
+  * xe_guc_pc_boost - Briefly raise the GT min frequency
+  * @pc: Xe_GuC_PC instance
+  *
+- * Safe to call from any context, including hard IRQ.
++ * Safe to call from any context, including hard IRQ, and on devices where GuC
++ * PC was never initialized.
+  */
+ void xe_guc_pc_boost(struct xe_guc_pc *pc)
+ {
+-	struct xe_device *xe = pc_to_xe(pc);
+-
+-	if (xe->info.skip_guc_pc || !READ_ONCE(xe_modparam.flip_boost))
+-		return;
+-
+-	if (READ_ONCE(pc->power_profile) == SLPC_POWER_PROFILE_POWER_SAVING)
++	if (!pc_boost_allowed(pc))
+ 		return;
+ 
+ 	queue_work(system_unbound_wq, &pc->boost_work);
+@@ -1428,6 +1479,7 @@ static void xe_guc_pc_fini_hw(void *arg)
+ 	struct xe_guc_pc *pc = arg;
+ 	struct xe_device *xe = pc_to_xe(pc);
+ 
++	WRITE_ONCE(pc->boost_ready, false);
+ 	cancel_work_sync(&pc->boost_work);
+ 	cancel_delayed_work_sync(&pc->unboost_work);
+ 
+@@ -1475,6 +1527,7 @@ int xe_guc_pc_init(struct xe_guc_pc *pc)
+ 
+ 	INIT_WORK(&pc->boost_work, xe_guc_pc_boost_work);
+ 	INIT_DELAYED_WORK(&pc->unboost_work, xe_guc_pc_unboost_work);
++	WRITE_ONCE(pc->boost_ready, true);
+ 
+ 	return devm_add_action_or_reset(xe->drm.dev, xe_guc_pc_fini_hw, pc);
+ }
+diff --git a/drivers/gpu/drm/xe/xe_guc_pc_types.h b/drivers/gpu/drm/xe/xe_guc_pc_types.h
+index 0c43caa..fd3fc69 100644
+--- a/drivers/gpu/drm/xe/xe_guc_pc_types.h
++++ b/drivers/gpu/drm/xe/xe_guc_pc_types.h
+@@ -44,6 +44,10 @@ struct xe_guc_pc {
+ 	bool boosted;
+ 	/** @boost_saved_min: min freq in effect before boosting, under @freq_lock */
+ 	u32 boost_saved_min;
++	/** @boost_retries: unboost attempts that hit -EAGAIN, under @freq_lock */
++	u8 boost_retries;
++	/** @boost_ready: boost works are initialized and may be queued */
++	bool boost_ready;
+ };
+ 
+ #endif	/* _XE_GUC_PC_TYPES_H_ */
+diff --git a/drivers/gpu/drm/xe/xe_tlb_inval.c b/drivers/gpu/drm/xe/xe_tlb_inval.c
+index c8f0463..6492a92 100644
+--- a/drivers/gpu/drm/xe/xe_tlb_inval.c
++++ b/drivers/gpu/drm/xe/xe_tlb_inval.c
+@@ -60,13 +60,33 @@ xe_tlb_inval_fence_signal(struct xe_tlb_inval_fence *fence)
+ 		dma_fence_put(&fence->base);
+ }
+ 
++/*
++ * Signal @fence unless someone (the TDR, reset) already did while the send
++ * was blocked: the fence may then already be off the list, and
++ * fence->tlb_inval cleared. Caller holds pending_lock.
++ */
+ static void
+-xe_tlb_inval_fence_signal_unlocked(struct xe_tlb_inval_fence *fence)
++xe_tlb_inval_fence_signal_if_pending_locked(struct xe_tlb_inval *tlb_inval,
++					    struct xe_tlb_inval_fence *fence)
+ {
+-	struct xe_tlb_inval *tlb_inval = fence->tlb_inval;
++	struct xe_tlb_inval_fence *f;
++
++	lockdep_assert_held(&tlb_inval->pending_lock);
++
++	list_for_each_entry(f, &tlb_inval->pending_fences, link) {
++		if (f == fence) {
++			xe_tlb_inval_fence_signal(fence);
++			break;
++		}
++	}
++}
+ 
++static void
++xe_tlb_inval_fence_signal_unlocked(struct xe_tlb_inval *tlb_inval,
++				   struct xe_tlb_inval_fence *fence)
++{
+ 	spin_lock_irq(&tlb_inval->pending_lock);
+-	xe_tlb_inval_fence_signal(fence);
++	xe_tlb_inval_fence_signal_if_pending_locked(tlb_inval, fence);
+ 	spin_unlock_irq(&tlb_inval->pending_lock);
+ }
+ 
+@@ -416,7 +436,7 @@ static void xe_tlb_inval_coalesce_work(struct work_struct *work)
+ 	xe_tlb_inval_fence_prep((__fence));			\
+ 	__ret = op((__tlb_inval), (__fence)->seqno, ##args);	\
+ 	if (__ret < 0)						\
+-		xe_tlb_inval_fence_signal_unlocked((__fence));	\
++		xe_tlb_inval_fence_signal_unlocked((__tlb_inval), (__fence)); \
+ 	mutex_unlock(&(__tlb_inval)->seqno_lock);		\
+ 								\
+ 	__ret == -ECANCELED ? 0 : __ret;			\
+@@ -518,7 +538,7 @@ int xe_tlb_inval_range(struct xe_tlb_inval *tlb_inval,
+ 	ret = tlb_inval->ops->ppgtt(tlb_inval, seqno, start, end, asid, NULL);
+ 	if (ret < 0) {
+ 		spin_lock_irq(&tlb_inval->pending_lock);
+-		xe_tlb_inval_fence_signal(fence);
++		xe_tlb_inval_fence_signal_if_pending_locked(tlb_inval, fence);
+ 		xe_tlb_inval_coalesce_update_locked(tlb_inval);
+ 		spin_unlock_irq(&tlb_inval->pending_lock);
+ 	}
+-- 
+2.55.0
+

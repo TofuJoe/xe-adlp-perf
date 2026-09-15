@@ -1,0 +1,203 @@
+From 89efa99734342da91f4b22f6f046973efc0f88f0 Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Mon, 14 Sep 2026 09:01:12 -0700
+Subject: [PATCH 01/22] drm/xe/display: Optimize remapped DPT pinning
+
+Remapped framebuffer views (used on ADL-P for large framebuffers) filled the
+display page table with one xe_bo_addr() call per page, and each call
+re-walked the BO's scatter-gather table from the start: O(N^2) in the
+framebuffer size. At 5120x2160 (N = 11264 pages) every page flip spent
+20-70 ms here, stalling the compositor's KMS thread and the cursor.
+
+Add xe_bo_addr_iter to walk the sg table once and use it for remapped DPT
+pinning. Unlike the posted series, the tiled walk ends at the last page of
+the last row instead of covering height * stride pages, which could run past
+the end of the BO.
+
+Based on "drm/xe/display: Optimize remapped DPT pinning" by Maarten
+Lankhorst (intel-xe, 2026-06-12, not merged).
+
+Assisted-by: Claude:claude-opus-5
+---
+ drivers/gpu/drm/xe/display/xe_fb_pin.c | 61 +++++++++++++++++++++-----
+ drivers/gpu/drm/xe/xe_bo.c             | 42 ++++++++++++++++++
+ drivers/gpu/drm/xe/xe_bo.h             |  3 ++
+ 3 files changed, 96 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/display/xe_fb_pin.c b/drivers/gpu/drm/xe/display/xe_fb_pin.c
+index 73469ea..2d8a53f 100644
+--- a/drivers/gpu/drm/xe/display/xe_fb_pin.c
++++ b/drivers/gpu/drm/xe/display/xe_fb_pin.c
+@@ -19,6 +19,7 @@
+ #include "xe_ggtt.h"
+ #include "xe_pat.h"
+ #include "xe_pm.h"
++#include "xe_res_cursor.h"
+ #include "xe_vram_types.h"
+ 
+ static void
+@@ -69,15 +70,19 @@ write_dpt_remapped_linear(struct xe_bo *bo, struct iosys_map *map,
+ 	struct xe_ggtt *ggtt = xe_device_get_root_tile(xe)->mem.ggtt;
+ 	const u64 pte = xe_ggtt_encode_pte_flags(ggtt, bo,
+ 						 xe_cache_pat_idx(xe, XE_CACHE_NONE));
+-	unsigned int offset = plane->offset * XE_PAGE_SIZE;
+-	unsigned int size = plane->size;
++	u64 offset = (u64)plane->offset * XE_PAGE_SIZE;
++	u64 size = (u64)plane->size * XE_PAGE_SIZE;
++	struct xe_res_cursor cur;
+ 
+-	while (size--) {
+-		u64 addr = xe_bo_addr(bo, offset, XE_PAGE_SIZE);
++	if (!size)
++		return dest;
++
++	/* One walk of the backing store instead of one per page (O(N), not O(N^2)). */
++	for (xe_bo_addr_iter_first(bo, &cur, offset, size); cur.remaining; xe_res_next(&cur, XE_PAGE_SIZE)) {
++		u64 addr = xe_bo_addr_iter_addr(&cur);
+ 
+ 		iosys_map_wr(map, dest, u64, addr | pte);
+ 		dest += sizeof(u64);
+-		offset += XE_PAGE_SIZE;
+ 	}
+ 
+ 	return dest;
+@@ -93,21 +98,57 @@ write_dpt_remapped_tiled(struct xe_bo *bo, struct iosys_map *map,
+ 	const u64 pte = xe_ggtt_encode_pte_flags(ggtt, bo,
+ 						 xe_cache_pat_idx(xe, XE_CACHE_NONE));
+ 	unsigned int offset, column, row;
++	struct xe_res_cursor cur;
++	u64 row_skip, size;
+ 
+-	for (row = 0; row < plane->height; row++) {
+-		offset = (plane->offset + plane->src_stride * row) *
+-			 XE_PAGE_SIZE;
++	if (!plane->height || !plane->width)
++		return dest;
++
++	if (plane->src_stride < plane->width) {
++		/* Rows overlap; keep the original (slow) per-page lookups. */
++		for (row = 0; row < plane->height; row++) {
++			offset = (plane->offset + plane->src_stride * row) *
++				 XE_PAGE_SIZE;
++
++			for (column = 0; column < plane->width; column++) {
++				u64 addr = xe_bo_addr(bo, offset, XE_PAGE_SIZE);
++
++				iosys_map_wr(map, dest, u64, addr | pte);
++				dest += sizeof(u64);
++				offset += XE_PAGE_SIZE;
++			}
++
++			dest = write_dpt_padding(map, dest,
++						 plane->dst_stride - plane->width);
++		}
+ 
++		return dest;
++	}
++
++	/*
++	 * One walk of the backing store for the whole plane instead of one
++	 * per page (O(N), not O(N^2)). The range ends at the last page of the
++	 * last row, so the cursor never runs past what the old code touched.
++	 */
++	row_skip = (u64)(plane->src_stride - plane->width) * XE_PAGE_SIZE;
++	size = ((u64)(plane->height - 1) * plane->src_stride + plane->width) *
++	       XE_PAGE_SIZE;
++	xe_bo_addr_iter_first(bo, &cur, (u64)plane->offset * XE_PAGE_SIZE, size);
++
++	for (row = 0; row < plane->height; row++) {
+ 		for (column = 0; column < plane->width; column++) {
+-			u64 addr = xe_bo_addr(bo, offset, XE_PAGE_SIZE);
++			u64 addr = xe_bo_addr_iter_addr(&cur);
+ 
+ 			iosys_map_wr(map, dest, u64, addr | pte);
+ 			dest += sizeof(u64);
+-			offset += XE_PAGE_SIZE;
++			xe_res_next(&cur, XE_PAGE_SIZE);
+ 		}
+ 
+ 		dest = write_dpt_padding(map, dest,
+ 					 plane->dst_stride - plane->width);
++
++		if (row_skip && row + 1 < plane->height)
++			xe_res_next(&cur, row_skip);
+ 	}
+ 
+ 	return dest;
+diff --git a/drivers/gpu/drm/xe/xe_bo.c b/drivers/gpu/drm/xe/xe_bo.c
+index 7ed7634..2d67aed 100644
+--- a/drivers/gpu/drm/xe/xe_bo.c
++++ b/drivers/gpu/drm/xe/xe_bo.c
+@@ -3171,6 +3171,48 @@ bool xe_bo_is_xe_bo(struct ttm_buffer_object *bo)
+ 	return false;
+ }
+ 
++/**
++ * xe_bo_addr_iter_first() - Start iterating over the physical/DMA addresses of a BO range
++ * @bo: The buffer object
++ * @cur: Cursor to initialise
++ * @offset: Start offset into the BO, in bytes
++ * @size: Size of the range to walk, in bytes
++ *
++ * Unlike repeated xe_bo_addr() calls, which restart the walk of the backing
++ * store on every call (O(N^2) over a large BO), this walks the backing store
++ * once. Advance with xe_res_next() and read with xe_bo_addr_iter_addr().
++ * Backport of "drm/xe/bo: Add xe_bo_addr_iter." (Maarten Lankhorst, 2026-06).
++ */
++void xe_bo_addr_iter_first(struct xe_bo *bo, struct xe_res_cursor *cur, u64 offset, u64 size)
++{
++	struct xe_device *xe = xe_bo_device(bo);
++
++	if (!xe_bo_is_vram(bo) && !xe_bo_is_stolen(bo)) {
++		xe_assert(xe, bo->ttm.ttm);
++
++		xe_res_first_sg(xe_bo_sg(bo), offset, size, cur);
++	} else {
++		xe_res_first(bo->ttm.resource, offset, size, cur);
++
++		xe_assert(xe, !cur->dma_addr);
++		cur->dma_start = vram_region_gpu_offset(bo->ttm.resource);
++	}
++}
++
++/**
++ * xe_bo_addr_iter_addr() - Address of the current cursor position
++ * @cur: Cursor initialised by xe_bo_addr_iter_first()
++ *
++ * Return: DMA address (system memory) or GPU offset (VRAM/stolen).
++ */
++dma_addr_t xe_bo_addr_iter_addr(struct xe_res_cursor *cur)
++{
++	if (cur->mem_type == XE_PL_TT)
++		return xe_res_dma(cur);
++
++	return cur->start + cur->dma_start;
++}
++
+ /*
+  * Resolve a BO address. There is no assert to check if the proper lock is held
+  * so it should only be used in cases where it is not fatal to get the wrong
+diff --git a/drivers/gpu/drm/xe/xe_bo.h b/drivers/gpu/drm/xe/xe_bo.h
+index 57039cf..35055ee 100644
+--- a/drivers/gpu/drm/xe/xe_bo.h
++++ b/drivers/gpu/drm/xe/xe_bo.h
+@@ -111,6 +111,7 @@ enum xe_madv_purgeable_state {
+ };
+ 
+ struct sg_table;
++struct xe_res_cursor;
+ 
+ struct xe_bo *xe_bo_alloc(void);
+ void xe_bo_free(struct xe_bo *bo);
+@@ -371,6 +372,8 @@ static inline void xe_bo_unpin_map_no_vm(struct xe_bo *bo)
+ }
+ 
+ bool xe_bo_is_xe_bo(struct ttm_buffer_object *bo);
++void xe_bo_addr_iter_first(struct xe_bo *bo, struct xe_res_cursor *cur, u64 offset, u64 size);
++dma_addr_t xe_bo_addr_iter_addr(struct xe_res_cursor *cur);
+ dma_addr_t __xe_bo_addr(struct xe_bo *bo, u64 offset, size_t page_size);
+ dma_addr_t xe_bo_addr(struct xe_bo *bo, u64 offset, size_t page_size);
+ 
+-- 
+2.55.0
+

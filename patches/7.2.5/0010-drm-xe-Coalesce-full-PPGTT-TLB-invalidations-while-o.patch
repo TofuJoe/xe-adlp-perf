@@ -1,0 +1,383 @@
+From e342899cf7263989bd3449b62b33650a86e8624c Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Mon, 14 Sep 2026 16:30:49 -0700
+Subject: [PATCH 10/22] drm/xe: Coalesce full PPGTT TLB invalidations while one
+ is in flight
+
+Platforms without range TLB invalidation (e.g. Xe-LP) send every PPGTT
+invalidation, one per unbind, to the GuC as a full flush of all TLBs, each
+with its own H2G/G2H round trip.
+
+While such a flush is outstanding, reserve one seqno for the next one and
+attach later requests to it instead of sending each; send it when nothing
+waits on the outstanding one any more (ack, timeout, reset or send error).
+Every attached request has finished its page-table update before attaching,
+and the merged flush is sent afterwards, so it covers all of them. Any other
+invalidation first sends the deferred one to keep seqnos in order.
+
+Disable at runtime with xe.tlb_inval_coalesce=0.
+
+Assisted-by: Claude:claude-opus-5
+---
+ drivers/gpu/drm/xe/xe_module.c          |   5 +
+ drivers/gpu/drm/xe/xe_module.h          |   1 +
+ drivers/gpu/drm/xe/xe_tlb_inval.c       | 203 ++++++++++++++++++++++--
+ drivers/gpu/drm/xe/xe_tlb_inval_types.h |  18 +++
+ 4 files changed, 217 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_module.c b/drivers/gpu/drm/xe/xe_module.c
+index 335347c..c465fdf 100644
+--- a/drivers/gpu/drm/xe/xe_module.c
++++ b/drivers/gpu/drm/xe/xe_module.c
+@@ -31,6 +31,7 @@ struct xe_modparam xe_modparam = {
+ 	.wedged_mode =		XE_DEFAULT_WEDGED_MODE,
+ 	.svm_notifier_size =	XE_DEFAULT_SVM_NOTIFIER_SIZE,
+ 	.flip_boost =		true,
++	.tlb_inval_coalesce =	true,
+ 	/* the rest are 0 by default */
+ };
+ 
+@@ -42,6 +43,10 @@ module_param_named(flip_boost, xe_modparam.flip_boost, bool, 0600);
+ MODULE_PARM_DESC(flip_boost, "Briefly raise the GPU min frequency when a page flip misses "
+ 		 "vblank because rendering has not finished [default=true]");
+ 
++module_param_named(tlb_inval_coalesce, xe_modparam.tlb_inval_coalesce, bool, 0600);
++MODULE_PARM_DESC(tlb_inval_coalesce, "On GPUs without range TLB invalidation, merge full PPGTT "
++		 "TLB invalidations requested while one is still in flight [default=true]");
++
+ module_param_named_unsafe(force_execlist, xe_modparam.force_execlist, bool, 0444);
+ MODULE_PARM_DESC(force_execlist, "Force Execlist submission");
+ 
+diff --git a/drivers/gpu/drm/xe/xe_module.h b/drivers/gpu/drm/xe/xe_module.h
+index aa4bda0..76c191f 100644
+--- a/drivers/gpu/drm/xe/xe_module.h
++++ b/drivers/gpu/drm/xe/xe_module.h
+@@ -26,6 +26,7 @@ struct xe_modparam {
+ 	unsigned int wedged_mode;
+ 	u32 svm_notifier_size;
+ 	bool flip_boost;
++	bool tlb_inval_coalesce;
+ };
+ 
+ extern struct xe_modparam xe_modparam;
+diff --git a/drivers/gpu/drm/xe/xe_tlb_inval.c b/drivers/gpu/drm/xe/xe_tlb_inval.c
+index bbd21d3..c8f0463 100644
+--- a/drivers/gpu/drm/xe/xe_tlb_inval.c
++++ b/drivers/gpu/drm/xe/xe_tlb_inval.c
+@@ -12,6 +12,7 @@
+ #include "xe_guc_ct.h"
+ #include "xe_guc_tlb_inval.h"
+ #include "xe_mmio.h"
++#include "xe_module.h"
+ #include "xe_pm.h"
+ #include "xe_tlb_inval.h"
+ #include "xe_trace.h"
+@@ -29,6 +30,9 @@
+ 
+ #define FENCE_STACK_BIT		DMA_FENCE_FLAG_USER_BITS
+ 
++static void xe_tlb_inval_coalesce_update_locked(struct xe_tlb_inval *tlb_inval);
++static void xe_tlb_inval_coalesce_work(struct work_struct *work);
++
+ static void xe_tlb_inval_fence_fini(struct xe_tlb_inval_fence *fence)
+ {
+ 	if (WARN_ON_ONCE(!fence->tlb_inval))
+@@ -96,6 +100,7 @@ static void xe_tlb_inval_fence_timeout(struct work_struct *work)
+ 	if (!list_empty(&tlb_inval->pending_fences))
+ 		queue_delayed_work(tlb_inval->timeout_wq, &tlb_inval->fence_tdr,
+ 				   timeout_delay);
++	xe_tlb_inval_coalesce_update_locked(tlb_inval);
+ 	spin_unlock_irq(&tlb_inval->pending_lock);
+ }
+ 
+@@ -111,6 +116,7 @@ static void tlb_inval_fini(struct drm_device *drm, void *arg)
+ {
+ 	struct xe_tlb_inval *tlb_inval = arg;
+ 
++	cancel_work_sync(&tlb_inval->coalesce.work);
+ 	xe_tlb_inval_reset(tlb_inval);
+ }
+ 
+@@ -145,6 +151,7 @@ int xe_gt_tlb_inval_init_early(struct xe_gt *gt)
+ 	spin_lock_init(&tlb_inval->pending_lock);
+ 	spin_lock_init(&tlb_inval->lock);
+ 	INIT_DELAYED_WORK(&tlb_inval->fence_tdr, xe_tlb_inval_fence_timeout);
++	INIT_WORK(&tlb_inval->coalesce.work, xe_tlb_inval_coalesce_work);
+ 
+ 	err = drmm_mutex_init(&xe->drm, &tlb_inval->seqno_lock);
+ 	if (err)
+@@ -211,6 +218,8 @@ void xe_tlb_inval_reset(struct xe_tlb_inval *tlb_inval)
+ 	list_for_each_entry_safe(fence, next,
+ 				 &tlb_inval->pending_fences, link)
+ 		xe_tlb_inval_fence_signal(fence);
++	tlb_inval->coalesce.deferred = false;
++	tlb_inval->coalesce.inflight = false;
+ 	spin_unlock_irq(&tlb_inval->pending_lock);
+ 	mutex_unlock(&tlb_inval->seqno_lock);
+ }
+@@ -244,26 +253,155 @@ static bool xe_tlb_inval_seqno_past(struct xe_tlb_inval *tlb_inval, int seqno)
+ 	return seqno_recv >= seqno;
+ }
+ 
+-static void xe_tlb_inval_fence_prep(struct xe_tlb_inval_fence *fence)
++/* Take the next seqno. Caller holds seqno_lock. */
++static int xe_tlb_inval_seqno_take(struct xe_tlb_inval *tlb_inval)
++{
++	int seqno = tlb_inval->seqno;
++
++	lockdep_assert_held(&tlb_inval->seqno_lock);
++
++	tlb_inval->seqno = (tlb_inval->seqno + 1) %
++		TLB_INVALIDATION_SEQNO_MAX;
++	if (!tlb_inval->seqno)
++		tlb_inval->seqno = 1;
++
++	return seqno;
++}
++
++/* Queue @fence to be signalled once @seqno is acked. Caller holds pending_lock. */
++static void xe_tlb_inval_fence_add_locked(struct xe_tlb_inval_fence *fence,
++					  int seqno)
+ {
+ 	struct xe_tlb_inval *tlb_inval = fence->tlb_inval;
+ 
+-	fence->seqno = tlb_inval->seqno;
+-	trace_xe_tlb_inval_fence_send(tlb_inval->xe, fence);
++	lockdep_assert_held(&tlb_inval->pending_lock);
+ 
+-	spin_lock_irq(&tlb_inval->pending_lock);
++	fence->seqno = seqno;
++	trace_xe_tlb_inval_fence_send(tlb_inval->xe, fence);
+ 	fence->inval_time = ktime_get();
+ 	list_add_tail(&fence->link, &tlb_inval->pending_fences);
+ 
+ 	if (list_is_singular(&tlb_inval->pending_fences))
+ 		queue_delayed_work(tlb_inval->timeout_wq, &tlb_inval->fence_tdr,
+ 				   tlb_inval->ops->timeout_delay(tlb_inval));
++}
++
++static void xe_tlb_inval_fence_prep(struct xe_tlb_inval_fence *fence)
++{
++	struct xe_tlb_inval *tlb_inval = fence->tlb_inval;
++	int seqno = xe_tlb_inval_seqno_take(tlb_inval);
++
++	spin_lock_irq(&tlb_inval->pending_lock);
++	xe_tlb_inval_fence_add_locked(fence, seqno);
+ 	spin_unlock_irq(&tlb_inval->pending_lock);
++}
+ 
+-	tlb_inval->seqno = (tlb_inval->seqno + 1) %
+-		TLB_INVALIDATION_SEQNO_MAX;
+-	if (!tlb_inval->seqno)
+-		tlb_inval->seqno = 1;
++/*
++ * Coalescing of full PPGTT invalidations.
++ *
++ * Without range TLB invalidation every PPGTT invalidation (one per unbind) is
++ * sent to the GuC as a full flush of every TLB. While one of those is still
++ * outstanding, further requests are not sent right away: their fences all
++ * wait on a single seqno that is reserved immediately and sent as one full
++ * flush once the outstanding one completes. This is safe because a request
++ * only reaches here after its page-table update is done, and the deferred
++ * flush is sent after that point, so it covers every fence attached to it.
++ *
++ * Seqnos must reach the GuC in order, so any other invalidation first sends
++ * the deferred one (see xe_tlb_inval_issue()).
++ */
++static bool xe_tlb_inval_can_coalesce(struct xe_tlb_inval *tlb_inval,
++				      struct drm_suballoc *prl_sa)
++{
++	struct xe_device *xe = tlb_inval->xe;
++
++	return !prl_sa && !xe->info.has_range_tlb_inval &&
++		!xe->info.has_ctx_tlb_inval &&
++		READ_ONCE(xe_modparam.tlb_inval_coalesce);
++}
++
++/* Signal every pending fence waiting on @seqno. Caller holds pending_lock. */
++static void xe_tlb_inval_signal_seqno_locked(struct xe_tlb_inval *tlb_inval,
++					     int seqno)
++{
++	struct xe_tlb_inval_fence *fence, *next;
++
++	lockdep_assert_held(&tlb_inval->pending_lock);
++
++	list_for_each_entry_safe(fence, next, &tlb_inval->pending_fences, link)
++		if (fence->seqno == seqno)
++			xe_tlb_inval_fence_signal(fence);
++}
++
++/*
++ * Drop the in-flight marker once nothing waits on it any more (acked, timed
++ * out, reset or failed to send), and kick the deferred invalidation.
++ */
++static void xe_tlb_inval_coalesce_update_locked(struct xe_tlb_inval *tlb_inval)
++{
++	struct xe_tlb_inval_fence *fence;
++
++	lockdep_assert_held(&tlb_inval->pending_lock);
++
++	if (tlb_inval->coalesce.inflight) {
++		bool waiting = false;
++
++		list_for_each_entry(fence, &tlb_inval->pending_fences, link) {
++			if (fence->seqno == tlb_inval->coalesce.inflight_seqno) {
++				waiting = true;
++				break;
++			}
++		}
++		if (!waiting)
++			tlb_inval->coalesce.inflight = false;
++	}
++
++	if (!tlb_inval->coalesce.inflight && tlb_inval->coalesce.deferred)
++		queue_work(tlb_inval->job_wq, &tlb_inval->coalesce.work);
++}
++
++/* Send the deferred invalidation, if any. Caller holds seqno_lock. */
++static void xe_tlb_inval_send_deferred(struct xe_tlb_inval *tlb_inval)
++{
++	u64 end = 1ull << tlb_inval->xe->info.va_bits;
++	int seqno, ret;
++
++	lockdep_assert_held(&tlb_inval->seqno_lock);
++
++	spin_lock_irq(&tlb_inval->pending_lock);
++	if (!tlb_inval->coalesce.deferred) {
++		spin_unlock_irq(&tlb_inval->pending_lock);
++		return;
++	}
++	seqno = tlb_inval->coalesce.deferred_seqno;
++	tlb_inval->coalesce.deferred = false;
++	tlb_inval->coalesce.inflight = true;
++	tlb_inval->coalesce.inflight_seqno = seqno;
++	spin_unlock_irq(&tlb_inval->pending_lock);
++
++	/* Full flush; the range and asid are ignored without range support. */
++	ret = tlb_inval->ops->ppgtt(tlb_inval, seqno, 0, end, 0, NULL);
++	if (ret < 0) {
++		spin_lock_irq(&tlb_inval->pending_lock);
++		xe_tlb_inval_signal_seqno_locked(tlb_inval, seqno);
++		xe_tlb_inval_coalesce_update_locked(tlb_inval);
++		spin_unlock_irq(&tlb_inval->pending_lock);
++	}
++}
++
++static void xe_tlb_inval_coalesce_work(struct work_struct *work)
++{
++	struct xe_tlb_inval *tlb_inval =
++		container_of(work, struct xe_tlb_inval, coalesce.work);
++	bool send;
++
++	mutex_lock(&tlb_inval->seqno_lock);
++	spin_lock_irq(&tlb_inval->pending_lock);
++	send = tlb_inval->coalesce.deferred && !tlb_inval->coalesce.inflight;
++	spin_unlock_irq(&tlb_inval->pending_lock);
++	if (send)
++		xe_tlb_inval_send_deferred(tlb_inval);
++	mutex_unlock(&tlb_inval->seqno_lock);
+ }
+ 
+ #define xe_tlb_inval_issue(__tlb_inval, __fence, op, args...)	\
+@@ -274,6 +412,7 @@ static void xe_tlb_inval_fence_prep(struct xe_tlb_inval_fence *fence)
+ 	xe_assert((__tlb_inval)->xe, (__fence));		\
+ 								\
+ 	mutex_lock(&(__tlb_inval)->seqno_lock); 		\
++	xe_tlb_inval_send_deferred((__tlb_inval));		\
+ 	xe_tlb_inval_fence_prep((__fence));			\
+ 	__ret = op((__tlb_inval), (__fence)->seqno, ##args);	\
+ 	if (__ret < 0)						\
+@@ -341,8 +480,51 @@ int xe_tlb_inval_range(struct xe_tlb_inval *tlb_inval,
+ 		       struct xe_tlb_inval_fence *fence, u64 start, u64 end,
+ 		       u32 asid, struct drm_suballoc *prl_sa)
+ {
+-	return xe_tlb_inval_issue(tlb_inval, fence, tlb_inval->ops->ppgtt,
+-				  start, end, asid, prl_sa);
++	int seqno, ret;
++
++	if (!xe_tlb_inval_can_coalesce(tlb_inval, prl_sa))
++		return xe_tlb_inval_issue(tlb_inval, fence, tlb_inval->ops->ppgtt,
++					  start, end, asid, prl_sa);
++
++	xe_assert(tlb_inval->xe, tlb_inval->ops);
++
++	mutex_lock(&tlb_inval->seqno_lock);
++	spin_lock_irq(&tlb_inval->pending_lock);
++
++	if (tlb_inval->coalesce.deferred) {
++		/* Not sent yet, so it will also cover this request. */
++		xe_tlb_inval_fence_add_locked(fence, tlb_inval->coalesce.deferred_seqno);
++		spin_unlock_irq(&tlb_inval->pending_lock);
++		mutex_unlock(&tlb_inval->seqno_lock);
++		return 0;
++	}
++
++	seqno = xe_tlb_inval_seqno_take(tlb_inval);
++	xe_tlb_inval_fence_add_locked(fence, seqno);
++
++	if (tlb_inval->coalesce.inflight) {
++		/* Sent when the outstanding one completes, see update_locked(). */
++		tlb_inval->coalesce.deferred = true;
++		tlb_inval->coalesce.deferred_seqno = seqno;
++		spin_unlock_irq(&tlb_inval->pending_lock);
++		mutex_unlock(&tlb_inval->seqno_lock);
++		return 0;
++	}
++
++	tlb_inval->coalesce.inflight = true;
++	tlb_inval->coalesce.inflight_seqno = seqno;
++	spin_unlock_irq(&tlb_inval->pending_lock);
++
++	ret = tlb_inval->ops->ppgtt(tlb_inval, seqno, start, end, asid, NULL);
++	if (ret < 0) {
++		spin_lock_irq(&tlb_inval->pending_lock);
++		xe_tlb_inval_fence_signal(fence);
++		xe_tlb_inval_coalesce_update_locked(tlb_inval);
++		spin_unlock_irq(&tlb_inval->pending_lock);
++	}
++	mutex_unlock(&tlb_inval->seqno_lock);
++
++	return ret == -ECANCELED ? 0 : ret;
+ }
+ 
+ /**
+@@ -421,6 +603,7 @@ void xe_tlb_inval_done_handler(struct xe_tlb_inval *tlb_inval, int seqno)
+ 	else
+ 		cancel_delayed_work(&tlb_inval->fence_tdr);
+ 
++	xe_tlb_inval_coalesce_update_locked(tlb_inval);
+ 	spin_unlock_irqrestore(&tlb_inval->pending_lock, flags);
+ }
+ 
+diff --git a/drivers/gpu/drm/xe/xe_tlb_inval_types.h b/drivers/gpu/drm/xe/xe_tlb_inval_types.h
+index 3d1797d..ff4f509 100644
+--- a/drivers/gpu/drm/xe/xe_tlb_inval_types.h
++++ b/drivers/gpu/drm/xe/xe_tlb_inval_types.h
+@@ -113,6 +113,24 @@ struct xe_tlb_inval {
+ 	spinlock_t lock;
+ 	/** @timeout_wq: schedules TLB invalidation fence timeouts */
+ 	struct workqueue_struct *timeout_wq;
++	/**
++	 * @coalesce: merging of full PPGTT invalidations on platforms without
++	 * range invalidation. Fields are protected by @pending_lock and only
++	 * modified with @seqno_lock also held, except @coalesce.inflight
++	 * which may also be cleared from the done/timeout handlers.
++	 */
++	struct {
++		/** @coalesce.inflight: a full PPGTT invalidation is outstanding */
++		bool inflight;
++		/** @coalesce.inflight_seqno: seqno of that invalidation */
++		int inflight_seqno;
++		/** @coalesce.deferred: fences wait for a not yet sent invalidation */
++		bool deferred;
++		/** @coalesce.deferred_seqno: seqno reserved for it */
++		int deferred_seqno;
++		/** @coalesce.work: sends the deferred invalidation */
++		struct work_struct work;
++	} coalesce;
+ };
+ 
+ /**
+-- 
+2.55.0
+

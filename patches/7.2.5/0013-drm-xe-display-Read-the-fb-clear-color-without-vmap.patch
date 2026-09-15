@@ -1,0 +1,53 @@
+From 7466b1600a17d6ec9c55aaa018ba37314c0247ca Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Mon, 14 Sep 2026 21:15:19 -0600
+Subject: [PATCH 13/22] drm/xe/display: Read the fb clear color without vmap
+
+intel_atomic_prepare_plane_clear_colors() reads 8 bytes from the pinned fb
+on every commit. xe_bo_read() goes through ttm_bo_access(), which takes the
+resv and, because scanout BOs are write-combined, vmap()s and vunmap()s the
+page each time (~18-30 us per commit measured on ADL-P, plus lazy vunmap
+TLB purges).
+
+For a pinned, populated system-memory BO on x86 without highmem, read the
+page through the direct map instead; fall back to xe_bo_read() otherwise.
+
+Assisted-by: Claude:claude-opus-5
+---
+ drivers/gpu/drm/xe/display/xe_display_bo.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/display/xe_display_bo.c b/drivers/gpu/drm/xe/display/xe_display_bo.c
+index 8953da0..f8aaba8 100644
+--- a/drivers/gpu/drm/xe/display/xe_display_bo.c
++++ b/drivers/gpu/drm/xe/display/xe_display_bo.c
+@@ -23,6 +23,26 @@ static bool xe_display_bo_is_protected(struct drm_gem_object *obj)
+ static int xe_display_bo_read_from_page(struct drm_gem_object *obj, u64 offset, void *dst, int size)
+ {
+ 	struct xe_bo *bo = gem_to_xe_bo(obj);
++	struct ttm_tt *tt = bo->ttm.ttm;
++
++	/*
++	 * The display reads the clear color from the pinned fb on every commit.
++	 * xe_bo_read() takes the resv and, because scanout BOs are
++	 * write-combined, vmap()s the page each time. A pinned system-memory BO
++	 * can't lose or move its pages, so read them through the direct map,
++	 * which x86 keeps attribute-consistent with the WC mapping.
++	 */
++	if (IS_ENABLED(CONFIG_X86) && !IS_ENABLED(CONFIG_HIGHMEM) &&
++	    size > 0 && offset + size <= xe_bo_size(bo) &&
++	    offset_in_page(offset) + size <= PAGE_SIZE &&
++	    READ_ONCE(bo->ttm.pin_count) && bo->ttm.type != ttm_bo_type_sg &&
++	    bo->ttm.resource && bo->ttm.resource->mem_type == XE_PL_TT &&
++	    tt && tt->pages && ttm_tt_is_populated(tt)) {
++		struct page *page = tt->pages[offset >> PAGE_SHIFT];
++
++		memcpy(dst, page_address(page) + offset_in_page(offset), size);
++		return 0;
++	}
+ 
+ 	return xe_bo_read(bo, offset, dst, size);
+ }
+-- 
+2.55.0
+

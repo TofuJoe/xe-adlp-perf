@@ -1,0 +1,121 @@
+From 6edba906adae57d0ece1fc0327fd1e689f4df45f Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Mon, 14 Sep 2026 10:33:26 -0700
+Subject: [PATCH 04/22] drm/xe/guc: Fix race around q->guc->suspend_pending
+ access
+
+Original author: Jagmeet Randhawa (intel-xe list; address redacted in the
+archive). Hand-port of v2 (https://ratatoskr.run/intel-xe/2026/08/17430507,
+2026-08-18, not yet merged) onto 7.2.5 + the handle_sched_done wake_up fix.
+The guc_exec_queue_suspend_timeout_ban() hunk is dropped: that function only
+exists from 7.3 on.
+
+Assisted-by: Claude:claude-opus-5
+---
+ drivers/gpu/drm/xe/xe_gpu_scheduler_types.h  |  5 +++-
+ drivers/gpu/drm/xe/xe_guc_exec_queue_types.h |  5 +++-
+ drivers/gpu/drm/xe/xe_guc_submit.c           | 25 ++++++++++++++++----
+ 3 files changed, 28 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_gpu_scheduler_types.h b/drivers/gpu/drm/xe/xe_gpu_scheduler_types.h
+index 63d9bf9..78ef2e8 100644
+--- a/drivers/gpu/drm/xe/xe_gpu_scheduler_types.h
++++ b/drivers/gpu/drm/xe/xe_gpu_scheduler_types.h
+@@ -47,7 +47,10 @@ struct xe_gpu_scheduler {
+ 	const struct xe_sched_backend_ops	*ops;
+ 	/** @msgs: list of messages to be processed in @work_process_msg */
+ 	struct list_head			msgs;
+-	/** @msg_lock: Message lock */
++	/**
++	 * @msg_lock: Protects @msgs and guc->suspend_pending (indicates a
++	 * suspend message is in flight) of exec queues on this scheduler.
++	 */
+ 	spinlock_t				msg_lock;
+ 	/** @work_process_msg: processes messages */
+ 	struct work_struct		work_process_msg;
+diff --git a/drivers/gpu/drm/xe/xe_guc_exec_queue_types.h b/drivers/gpu/drm/xe/xe_guc_exec_queue_types.h
+index cda14d9..f53cf6a 100644
+--- a/drivers/gpu/drm/xe/xe_guc_exec_queue_types.h
++++ b/drivers/gpu/drm/xe/xe_guc_exec_queue_types.h
+@@ -52,7 +52,10 @@ struct xe_guc_exec_queue {
+ 	u16 id;
+ 	/** @suspend_wait: wait queue used to wait on pending suspends */
+ 	wait_queue_head_t suspend_wait;
+-	/** @suspend_pending: a suspend of the exec_queue is pending */
++	/**
++	 * @suspend_pending: a suspend of the exec_queue is pending.
++	 * Protected by @sched.msg_lock.
++	 */
+ 	bool suspend_pending;
+ 	/**
+ 	 * @needs_cleanup: Needs a cleanup message during VF post migration
+diff --git a/drivers/gpu/drm/xe/xe_guc_submit.c b/drivers/gpu/drm/xe/xe_guc_submit.c
+index d353906..07acb88 100644
+--- a/drivers/gpu/drm/xe/xe_guc_submit.c
++++ b/drivers/gpu/drm/xe/xe_guc_submit.c
+@@ -1849,9 +1849,13 @@ static void __guc_exec_queue_process_msg_suspend(struct xe_sched_msg *msg)
+ 			set_exec_queue_suspended(q);
+ 			disable_scheduling(q, false);
+ 		}
+-	} else if (q->guc->suspend_pending) {
+-		set_exec_queue_suspended(q);
+-		suspend_fence_signal(q);
++	} else {
++		xe_sched_msg_lock(&q->guc->sched);
++		if (q->guc->suspend_pending) {
++			set_exec_queue_suspended(q);
++			suspend_fence_signal(q);
++		}
++		xe_sched_msg_unlock(&q->guc->sched);
+ 	}
+ }
+ 
+@@ -2034,7 +2038,9 @@ static void guc_exec_queue_kill(struct xe_exec_queue *q)
+ {
+ 	trace_xe_exec_queue_kill(q);
+ 	set_exec_queue_killed(q);
++	xe_sched_msg_lock(&q->guc->sched);
+ 	__suspend_fence_signal(q);
++	xe_sched_msg_unlock(&q->guc->sched);
+ 	xe_guc_exec_queue_trigger_cleanup(q);
+ }
+ 
+@@ -2299,10 +2305,12 @@ static void guc_exec_queue_stop(struct xe_guc *guc, struct xe_exec_queue *q)
+ 		if (exec_queue_destroyed(q))
+ 			do_destroy = true;
+ 	}
++	xe_sched_msg_lock(sched);
+ 	if (q->guc->suspend_pending) {
+ 		set_exec_queue_suspended(q);
+ 		suspend_fence_signal(q);
+ 	}
++	xe_sched_msg_unlock(sched);
+ 	atomic_and(EXEC_QUEUE_STATE_WEDGED | EXEC_QUEUE_STATE_BANNED |
+ 		   EXEC_QUEUE_STATE_KILLED | EXEC_QUEUE_STATE_DESTROYED |
+ 		   EXEC_QUEUE_STATE_SUSPENDED,
+@@ -2826,13 +2834,20 @@ static void handle_sched_done(struct xe_guc *guc, struct xe_exec_queue *q,
+ 		smp_wmb();
+ 		wake_up_all(&guc->ct.wq);
+ 	} else {
++		bool was_pending;
++
+ 		xe_gt_assert(guc_to_gt(guc), runnable_state == 0);
+ 		xe_gt_assert(guc_to_gt(guc), exec_queue_pending_disable(q));
+ 
+-		if (q->guc->suspend_pending) {
++		xe_sched_msg_lock(&q->guc->sched);
++		was_pending = q->guc->suspend_pending;
++		if (was_pending) {
+ 			clear_exec_queue_pending_disable(q);
+ 			suspend_fence_signal(q);
+-		} else {
++		}
++		xe_sched_msg_unlock(&q->guc->sched);
++
++		if (!was_pending) {
+ 			bool destroyed = exec_queue_destroyed(q);
+ 
+ 			/*
+-- 
+2.55.0
+

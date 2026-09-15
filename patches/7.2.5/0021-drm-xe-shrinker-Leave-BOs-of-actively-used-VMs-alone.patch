@@ -1,0 +1,151 @@
+From e68b7ab47c9f1dca7ab742fb4ce5bec57c023f6d Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Tue, 15 Sep 2026 07:46:30 -0600
+Subject: [PATCH 21/22] drm/xe/shrinker: Leave BOs of actively used VMs alone
+
+Every exec restores all evicted BOs bound in its VM before running
+(xe_vm_validate_rebind), but the shrinker did not consider whether a VM was
+in use. Under memory pressure it kept backing up BOs of VMs rendering every
+frame, which their next exec swapped straight back in. Measured on ADL-P
+with 6 GB of GPU memory and zram swap: ~254 BOs/s backed up and ~270/s
+restored, ~25% of a core, with affected execs at ~460 us instead of ~36 us.
+
+Record the last exec time per VM. In xe_bo_shrink(), skip non-purgeable
+BOs whose VM executed, or shared BOs an exec locked (lru_refresh_jiffies),
+within xe.shrink_active_ms (default 1000, 0 disables). The skip happens
+before the BO is accounted as scanned, so the walk moves on to idle BOs,
+and returns SHRINK_STOP if nothing idle is left.
+
+Assisted-by: Claude:claude-opus-5
+---
+ drivers/gpu/drm/xe/xe_bo.c       | 31 +++++++++++++++++++++++++++++++
+ drivers/gpu/drm/xe/xe_exec.c     |  2 ++
+ drivers/gpu/drm/xe/xe_module.c   |  5 +++++
+ drivers/gpu/drm/xe/xe_module.h   |  1 +
+ drivers/gpu/drm/xe/xe_vm_types.h |  6 ++++++
+ 5 files changed, 45 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_bo.c b/drivers/gpu/drm/xe/xe_bo.c
+index b636a19..2aadc8d 100644
+--- a/drivers/gpu/drm/xe/xe_bo.c
++++ b/drivers/gpu/drm/xe/xe_bo.c
+@@ -27,6 +27,7 @@
+ #include "xe_drm_client.h"
+ #include "xe_ggtt.h"
+ #include "xe_map.h"
++#include "xe_module.h"
+ #include "xe_migrate.h"
+ #include "xe_pat.h"
+ #include "xe_pm.h"
+@@ -1309,6 +1310,26 @@ xe_bo_eviction_valuable(struct ttm_buffer_object *bo, const struct ttm_place *pl
+  * Return: The number of pages shrunken or purged, or negative error
+  * code on failure.
+  */
++/*
++ * Whether @bo was used by a submission very recently: for a VM-private BO, its
++ * VM executed; for a shared BO, an exec locked it (lru_refresh_jiffies). An
++ * exec restores every evicted BO bound in its VM before running, so backing up
++ * such a BO only makes the next frame swap it straight back in.
++ */
++static bool xe_bo_shrink_recently_used(struct xe_bo *bo)
++{
++	unsigned int window_ms = READ_ONCE(xe_modparam.shrink_active_ms);
++	unsigned long last;
++
++	if (!window_ms)
++		return false;
++
++	last = bo->vm ? READ_ONCE(bo->vm->last_exec_jiffies) :
++		READ_ONCE(bo->lru_refresh_jiffies);
++
++	return last && time_before(jiffies, last + msecs_to_jiffies(window_ms));
++}
++
+ long xe_bo_shrink(struct ttm_operation_ctx *ctx, struct ttm_buffer_object *bo,
+ 		  const struct xe_bo_shrink_flags flags,
+ 		  unsigned long *scanned)
+@@ -1331,6 +1352,16 @@ long xe_bo_shrink(struct ttm_operation_ctx *ctx, struct ttm_buffer_object *bo,
+ 	if (!xe_bo_is_xe_bo(bo) || !xe_bo_get_unless_zero(xe_bo))
+ 		return xe_bo_shrink_purge(ctx, bo, scanned);
+ 
++	/*
++	 * Purgeable (DONTNEED) BOs may go regardless. Others in active use are
++	 * skipped before being accounted as scanned, which the shrinker walk
++	 * treats as "try the next BO".
++	 */
++	if (!xe_tt->purgeable && xe_bo_shrink_recently_used(xe_bo)) {
++		lret = -EBUSY;
++		goto out_unref;
++	}
++
+ 	xe_bo_backing_changed(xe_bo);
+ 
+ 	if (xe_tt->purgeable) {
+diff --git a/drivers/gpu/drm/xe/xe_exec.c b/drivers/gpu/drm/xe/xe_exec.c
+index 78c0fc1..39e36aa 100644
+--- a/drivers/gpu/drm/xe/xe_exec.c
++++ b/drivers/gpu/drm/xe/xe_exec.c
+@@ -171,6 +171,8 @@ int xe_exec_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
+ 	}
+ 
+ 	vm = q->vm;
++	/* Lets the shrinker leave this VM's BOs alone while it is in use. */
++	WRITE_ONCE(vm->last_exec_jiffies, jiffies ?: 1);
+ 
+ 	for (num_syncs = 0; num_syncs < args->num_syncs; num_syncs++) {
+ 		err = xe_sync_entry_parse(xe, xef, &syncs[num_syncs],
+diff --git a/drivers/gpu/drm/xe/xe_module.c b/drivers/gpu/drm/xe/xe_module.c
+index c465fdf..ceaa176 100644
+--- a/drivers/gpu/drm/xe/xe_module.c
++++ b/drivers/gpu/drm/xe/xe_module.c
+@@ -32,6 +32,7 @@ struct xe_modparam xe_modparam = {
+ 	.svm_notifier_size =	XE_DEFAULT_SVM_NOTIFIER_SIZE,
+ 	.flip_boost =		true,
+ 	.tlb_inval_coalesce =	true,
++	.shrink_active_ms =	1000,
+ 	/* the rest are 0 by default */
+ };
+ 
+@@ -43,6 +44,10 @@ module_param_named(flip_boost, xe_modparam.flip_boost, bool, 0600);
+ MODULE_PARM_DESC(flip_boost, "Briefly raise the GPU min frequency when a page flip misses "
+ 		 "vblank because rendering has not finished [default=true]");
+ 
++module_param_named(shrink_active_ms, xe_modparam.shrink_active_ms, uint, 0600);
++MODULE_PARM_DESC(shrink_active_ms, "Don't let the shrinker back up BOs of a VM that submitted work, "
++		 "or shared BOs used by a submission, within this many ms; 0 disables [default=1000]");
++
+ module_param_named(tlb_inval_coalesce, xe_modparam.tlb_inval_coalesce, bool, 0600);
+ MODULE_PARM_DESC(tlb_inval_coalesce, "On GPUs without range TLB invalidation, merge full PPGTT "
+ 		 "TLB invalidations requested while one is still in flight [default=true]");
+diff --git a/drivers/gpu/drm/xe/xe_module.h b/drivers/gpu/drm/xe/xe_module.h
+index 76c191f..ffd6e3f 100644
+--- a/drivers/gpu/drm/xe/xe_module.h
++++ b/drivers/gpu/drm/xe/xe_module.h
+@@ -27,6 +27,7 @@ struct xe_modparam {
+ 	u32 svm_notifier_size;
+ 	bool flip_boost;
+ 	bool tlb_inval_coalesce;
++	unsigned int shrink_active_ms;
+ };
+ 
+ extern struct xe_modparam xe_modparam;
+diff --git a/drivers/gpu/drm/xe/xe_vm_types.h b/drivers/gpu/drm/xe/xe_vm_types.h
+index 635ed29..61d2265 100644
+--- a/drivers/gpu/drm/xe/xe_vm_types.h
++++ b/drivers/gpu/drm/xe/xe_vm_types.h
+@@ -210,6 +210,12 @@ struct xe_vm {
+ 	/** @gpuvm: base GPUVM used to track VMAs */
+ 	struct drm_gpuvm gpuvm;
+ 
++	/**
++	 * @last_exec_jiffies: jiffies of the last exec on this VM (0: none).
++	 * Read locklessly by the shrinker to leave actively used VMs alone.
++	 */
++	unsigned long last_exec_jiffies;
++
+ 	/** @svm: Shared virtual memory state */
+ 	struct {
+ 		/** @svm.gpusvm: base GPUSVM used to track fault allocations */
+-- 
+2.55.0
+

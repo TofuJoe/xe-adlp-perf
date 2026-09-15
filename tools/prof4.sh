@@ -1,0 +1,12 @@
+#!/bin/bash
+# ftrace function_profile: atomic check/commit internals.
+# Run as root while something repaints: sudo tools/prof4.sh SECONDS (e.g. 6)
+# prof4.sh seconds: CPU-only profile of atomic check/commit internals (xe display)
+T=/sys/kernel/tracing
+FUNCS="drm_mode_atomic_ioctl intel_atomic_commit_tail intel_atomic_check gen9_disable_dc_states icl_plane_update_arm icl_plane_update_noarm skl_plane_update_arm skl_plane_update_noarm intel_color_commit_arm intel_color_commit_noarm intel_color_load_luts intel_color_post_update intel_commit_modeset_enables skl_commit_modeset_enables intel_crtc_atomic_check intel_crtc_duplicate_state intel_crtc_update_active_timings intel_crtc_vblank_work intel_display_power_get intel_display_power_get_in_set __intel_display_power_put_async intel_dmc_wl_get intel_dmc_wl_put intel_dsb_commit intel_dsb_finish intel_dsb_prepare intel_fbc_atomic_check intel_fbc_post_update intel_fbc_pre_update intel_pipe_update_end intel_pipe_update_start intel_plane_atomic_check intel_plane_check_stride intel_plane_compute_gtt intel_plane_duplicate_state intel_plane_remap_gtt intel_pmdemand_post_plane_update intel_pmdemand_pre_plane_update intel_post_plane_update intel_pre_plane_update intel_psr_wait_for_idle_locked intel_sagv_post_plane_update intel_sagv_pre_plane_update intel_vblank_evade intel_vrr_send_push skl_ddb_add_affected_planes skl_plane_check skl_wm_add_affected_planes intel_atomic_state_clear intel_atomic_state_alloc __intel_de_wait_for_register intel_wait_for_vblank_if_active intel_drrs_activate skl_compute_wm drm_atomic_helper_wait_for_flip_done drm_atomic_state_default_clear drm_atomic_helper_swap_state drm_atomic_helper_setup_commit drm_atomic_get_plane_state drm_atomic_set_property drm_atomic_state_alloc __drm_atomic_state_free drm_crtc_vblank_get drm_vblank_put intel_crtc_get_vblank_counter"
+echo 0 > $T/function_profile_enabled; echo 0 > $T/options/sleep-time; echo > $T/set_ftrace_filter
+for f in $FUNCS; do case $f in drm_*|__drm_*) echo "$f" >> $T/set_ftrace_filter 2>/dev/null;; *) echo "$f:mod:xe" >> $T/set_ftrace_filter 2>/dev/null;; esac; done
+echo "filtered: $(wc -l < $T/set_ftrace_filter)"
+echo 1 > $T/function_profile_enabled; python3 -c "import time; time.sleep($1)"; echo 0 > $T/function_profile_enabled
+cat $T/trace_stat/function* | awk '$1!="Function" && $1!~/^-/ && NF>=4 {h[$1]+=$2; t[$1]+=$3} END {for (f in h) printf "%-38s %6d calls %9.1f us total %7.1f us avg\n", f, h[f], t[f], t[f]/h[f]}' | sort -k4 -nr
+echo > $T/set_ftrace_filter; echo 1 > $T/options/sleep-time

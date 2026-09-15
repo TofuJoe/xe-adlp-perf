@@ -1,0 +1,233 @@
+From 1763e531faf33af659e6321d394d3d5ee1170d94 Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Mon, 14 Sep 2026 16:21:11 -0700
+Subject: [PATCH 05/22] drm/xe/display: Pool DPT BOs instead of creating one
+ per page flip
+
+Every flip of a DPT framebuffer created a new DPT BO and destroyed the
+previous one, since compositors alternate framebuffers and reuse_vma only
+matches the same fb. Measured on ADL-P eDP: ~125 us pin + ~50 us unpin of
+kernel CPU per flip, ~38% of the commit.
+
+Keep up to four released DPT BOs pinned, mapped and GGTT-bound, and reuse
+one with matching size and alignment. Contents are cleared and fully
+rewritten on every pin.
+
+Assisted-by: Claude:claude-opus-5
+---
+ drivers/gpu/drm/xe/display/xe_display.c |  16 ++++
+ drivers/gpu/drm/xe/display/xe_fb_pin.c  | 103 +++++++++++++++++++++---
+ drivers/gpu/drm/xe/display/xe_fb_pin.h  |   5 ++
+ drivers/gpu/drm/xe/xe_device_types.h    |  13 +++
+ 4 files changed, 126 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/display/xe_display.c b/drivers/gpu/drm/xe/display/xe_display.c
+index c0d3e7d..382c782 100644
+--- a/drivers/gpu/drm/xe/display/xe_display.c
++++ b/drivers/gpu/drm/xe/display/xe_display.c
+@@ -38,6 +38,7 @@
+ #include "skl_watermark.h"
+ #include "xe_device.h"
+ #include "xe_display_bo.h"
++#include "xe_fb_pin.h"
+ #include "xe_display_pcode.h"
+ #include "xe_display_rpm.h"
+ #include "xe_dsb_buffer.h"
+@@ -154,6 +155,11 @@ static void xe_display_fini(void *arg)
+ 	intel_display_driver_remove(display);
+ }
+ 
++static void xe_display_dpt_pool_fini(void *arg)
++{
++	xe_fb_pin_dpt_pool_fini(arg);
++}
++
+ int xe_display_init(struct xe_device *xe)
+ {
+ 	struct intel_display *display = xe->display;
+@@ -162,6 +168,16 @@ int xe_display_init(struct xe_device *xe)
+ 	if (!xe->info.probe_display)
+ 		return 0;
+ 
++	/*
++	 * Registered before xe_display_fini so that it runs after display
++	 * teardown has unpinned (and pooled) every DPT, and before the GGTT
++	 * goes away.
++	 */
++	xe_fb_pin_dpt_pool_init(xe);
++	err = devm_add_action_or_reset(xe->drm.dev, xe_display_dpt_pool_fini, xe);
++	if (err)
++		return err;
++
+ 	err = intel_display_driver_probe(display);
+ 	if (err)
+ 		return err;
+diff --git a/drivers/gpu/drm/xe/display/xe_fb_pin.c b/drivers/gpu/drm/xe/display/xe_fb_pin.c
+index 2d8a53f..2774a4e 100644
+--- a/drivers/gpu/drm/xe/display/xe_fb_pin.c
++++ b/drivers/gpu/drm/xe/display/xe_fb_pin.c
+@@ -184,6 +184,81 @@ write_dpt_remapped(struct xe_bo *bo,
+ 	}
+ }
+ 
++/*
++ * DPT BO pool. On ADL-P and DISPLAY_VER >= 14 every page flip of a DPT
++ * framebuffer used to create a new DPT BO (TTM init, shmem backup file, page
++ * allocation, vmap, GGTT insert) and destroy the previous one, because the
++ * compositor alternates between framebuffers and xe_fb_pin_reuse_vma() only
++ * matches the same one. Keep a few released DPT BOs pinned and mapped, and hand
++ * them back out. The contents are cleared and fully rewritten from the current
++ * framebuffer backing store on every pin, so nothing stale survives.
++ */
++void xe_fb_pin_dpt_pool_init(struct xe_device *xe)
++{
++	spin_lock_init(&xe->dpt_pool.lock);
++}
++
++void xe_fb_pin_dpt_pool_fini(struct xe_device *xe)
++{
++	struct xe_bo *bo[XE_DPT_POOL_SIZE];
++	int i;
++
++	spin_lock(&xe->dpt_pool.lock);
++	for (i = 0; i < XE_DPT_POOL_SIZE; i++) {
++		bo[i] = xe->dpt_pool.bo[i];
++		xe->dpt_pool.bo[i] = NULL;
++	}
++	spin_unlock(&xe->dpt_pool.lock);
++
++	for (i = 0; i < XE_DPT_POOL_SIZE; i++)
++		if (bo[i])
++			xe_bo_unpin_map_no_vm(bo[i]);
++}
++
++static struct xe_bo *dpt_pool_get(struct xe_device *xe, u8 tile_id,
++				  size_t size, u32 alignment)
++{
++	struct xe_bo *bo = NULL;
++	int i;
++
++	spin_lock(&xe->dpt_pool.lock);
++	for (i = 0; i < XE_DPT_POOL_SIZE; i++) {
++		struct xe_bo *cand = xe->dpt_pool.bo[i];
++
++		if (!cand || xe_bo_size(cand) != size)
++			continue;
++		if (alignment &&
++		    !IS_ALIGNED(xe_ggtt_node_addr(cand->ggtt_node[tile_id]),
++				alignment))
++			continue;
++
++		bo = cand;
++		xe->dpt_pool.bo[i] = NULL;
++		break;
++	}
++	spin_unlock(&xe->dpt_pool.lock);
++
++	return bo;
++}
++
++static void dpt_pool_put(struct xe_device *xe, struct xe_bo *dpt)
++{
++	int i;
++
++	spin_lock(&xe->dpt_pool.lock);
++	for (i = 0; i < XE_DPT_POOL_SIZE; i++) {
++		if (!xe->dpt_pool.bo[i]) {
++			xe->dpt_pool.bo[i] = dpt;
++			dpt = NULL;
++			break;
++		}
++	}
++	spin_unlock(&xe->dpt_pool.lock);
++
++	if (dpt)
++		xe_bo_unpin_map_no_vm(dpt);
++}
++
+ static int __xe_pin_fb_vma_dpt(struct drm_gem_object *obj,
+ 			       const struct intel_fb_pin_params *pin_params,
+ 			       struct i915_vma *vma)
+@@ -205,16 +280,22 @@ static int __xe_pin_fb_vma_dpt(struct drm_gem_object *obj,
+ 		dpt_size = ALIGN(intel_rotation_info_size(&view->rotated) * 8,
+ 				 XE_PAGE_SIZE);
+ 
+-	dpt = xe_bo_create_pin_map_at_novm(xe, tile0,
+-					   dpt_size,  ~0ull,
+-					   ttm_bo_type_kernel,
+-					   XE_BO_FLAG_VRAM_IF_DGFX(tile0) |
+-					   XE_BO_FLAG_GGTT |
+-					   XE_BO_FLAG_PAGETABLE |
+-					   XE_BO_FLAG_FORCE_WC,
+-					   pin_params->alignment, false);
+-	if (IS_ERR(dpt))
+-		return PTR_ERR(dpt);
++	dpt = dpt_pool_get(xe, tile0->id, dpt_size, pin_params->alignment);
++	if (dpt) {
++		/* A fresh BO starts zeroed; padding entries are never written. */
++		iosys_map_memset(&dpt->vmap, 0, 0, dpt_size);
++	} else {
++		dpt = xe_bo_create_pin_map_at_novm(xe, tile0,
++						   dpt_size,  ~0ull,
++						   ttm_bo_type_kernel,
++						   XE_BO_FLAG_VRAM_IF_DGFX(tile0) |
++						   XE_BO_FLAG_GGTT |
++						   XE_BO_FLAG_PAGETABLE |
++						   XE_BO_FLAG_FORCE_WC,
++						   pin_params->alignment, false);
++		if (IS_ERR(dpt))
++			return PTR_ERR(dpt);
++	}
+ 
+ 	if (view->type == I915_GTT_VIEW_NORMAL) {
+ 		u64 pte = xe_ggtt_encode_pte_flags(ggtt, bo, xe_cache_pat_idx(xe, XE_CACHE_NONE));
+@@ -429,7 +510,7 @@ static void __xe_unpin_fb_vma(struct i915_vma *vma)
+ 		return;
+ 
+ 	if (vma->dpt)
+-		xe_bo_unpin_map_no_vm(vma->dpt);
++		dpt_pool_put(xe_bo_device(vma->bo), vma->dpt);
+ 	else if (vma->bo->ggtt_node[tile_id] != vma->node)
+ 		xe_ggtt_node_remove(vma->node, false);
+ 
+diff --git a/drivers/gpu/drm/xe/display/xe_fb_pin.h b/drivers/gpu/drm/xe/display/xe_fb_pin.h
+index 20dd8a9..8d75371 100644
+--- a/drivers/gpu/drm/xe/display/xe_fb_pin.h
++++ b/drivers/gpu/drm/xe/display/xe_fb_pin.h
+@@ -18,4 +18,9 @@ int xe_fb_pin_ggtt_pin(struct drm_gem_object *obj,
+ 
+ extern const struct intel_display_fb_pin_interface xe_display_fb_pin_interface;
+ 
++struct xe_device;
++
++void xe_fb_pin_dpt_pool_init(struct xe_device *xe);
++void xe_fb_pin_dpt_pool_fini(struct xe_device *xe);
++
+ #endif /* __XE_FB_PIN_H__ */
+diff --git a/drivers/gpu/drm/xe/xe_device_types.h b/drivers/gpu/drm/xe/xe_device_types.h
+index aad1089..bfab800 100644
+--- a/drivers/gpu/drm/xe/xe_device_types.h
++++ b/drivers/gpu/drm/xe/xe_device_types.h
+@@ -570,6 +570,19 @@ struct xe_device {
+ 	struct intel_uncore {
+ 		spinlock_t lock;
+ 	} uncore;
++
++	/**
++	 * @dpt_pool: recently released DPT BOs, still pinned, mapped and bound
++	 * in the GGTT, reused by the next DPT pin of the same size/alignment so
++	 * that page flips don't create and destroy a BO every frame.
++	 */
++	struct {
++		/** @dpt_pool.lock: protects @dpt_pool.bo */
++		spinlock_t lock;
++#define XE_DPT_POOL_SIZE 4
++		/** @dpt_pool.bo: cached DPT BOs, NULL for empty slots */
++		struct xe_bo *bo[XE_DPT_POOL_SIZE];
++	} dpt_pool;
+ #endif
+ };
+ 
+-- 
+2.55.0
+

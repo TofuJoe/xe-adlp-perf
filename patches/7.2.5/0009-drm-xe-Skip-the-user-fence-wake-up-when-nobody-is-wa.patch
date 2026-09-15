@@ -1,0 +1,46 @@
+From a56c698697bb1415805f22f5b99a8a895e76b298 Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Mon, 14 Sep 2026 16:27:14 -0700
+Subject: [PATCH 09/22] drm/xe: Skip the user fence wake-up when nobody is
+ waiting
+
+xe_hw_engine_handle_irq() called wake_up_all() on the device-wide ufence
+wait queue for every engine interrupt, taking its spinlock hundreds of
+times per second on a busy desktop even though a WAIT_USER_FENCE sleeper
+is rare. Check wq_has_sleeper() first.
+
+The wake-up itself stays unconditional on interrupt type and device-wide:
+the uAPI documents a wake-up on every engine interrupt, and an interrupt
+cannot be attributed to the process whose value changed.
+
+Assisted-by: Claude:claude-opus-5
+---
+ drivers/gpu/drm/xe/xe_hw_engine.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_hw_engine.c b/drivers/gpu/drm/xe/xe_hw_engine.c
+index 0b193c4..038a018 100644
+--- a/drivers/gpu/drm/xe/xe_hw_engine.c
++++ b/drivers/gpu/drm/xe/xe_hw_engine.c
+@@ -896,7 +896,17 @@ int xe_hw_engines_init(struct xe_gt *gt)
+ 
+ void xe_hw_engine_handle_irq(struct xe_hw_engine *hwe, u16 intr_vec)
+ {
+-	wake_up_all(&gt_to_xe(hwe->gt)->ufence_wq);
++	struct wait_queue_head *ufence_wq = &gt_to_xe(hwe->gt)->ufence_wq;
++
++	/*
++	 * The WAIT_USER_FENCE uAPI promises a wake-up on every engine interrupt,
++	 * since the GPU may have written the value being waited on. Almost
++	 * always nobody is waiting, so skip the wait-queue lock in that case.
++	 * Safe against a concurrent waiter: it adds itself to the queue before
++	 * comparing the value, and the value was written before the interrupt.
++	 */
++	if (wq_has_sleeper(ufence_wq))
++		wake_up_all(ufence_wq);
+ 
+ 	if (hwe->irq_handler)
+ 		hwe->irq_handler(hwe, intr_vec);
+-- 
+2.55.0
+

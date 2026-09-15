@@ -1,0 +1,347 @@
+From 44436d113e7c6a8a417091c85dcc95d8bef68be1 Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Mon, 14 Sep 2026 16:23:42 -0700
+Subject: [PATCH 06/22] drm/xe: Boost GT min frequency when a page flip misses
+ vblank
+
+The display calls the parent rps boost_if_not_started hook at the vblank
+after a flip was queued, but xe provided no rps interface, so SLPC started
+every burst of rendering from the efficient frequency with nothing reacting
+to missed frames.
+
+Implement the hook: if the flip fence is still unsignalled, raise the SLPC
+min frequency to RP0 (capped by a user max) and restore the previous or
+user-requested min 100 ms after the last miss. Skipped in the power_saving
+profile; disable at runtime with xe.flip_boost=0.
+
+Also drops a duplicate xe_fb_pin.h include from the previous commit.
+
+Assisted-by: Claude:claude-opus-5
+---
+ drivers/gpu/drm/xe/display/xe_display.c | 78 ++++++++++++++++++++-
+ drivers/gpu/drm/xe/xe_guc_pc.c          | 90 +++++++++++++++++++++++++
+ drivers/gpu/drm/xe/xe_guc_pc.h          |  1 +
+ drivers/gpu/drm/xe/xe_guc_pc_types.h    |  9 +++
+ drivers/gpu/drm/xe/xe_module.c          |  5 ++
+ drivers/gpu/drm/xe/xe_module.h          |  1 +
+ 6 files changed, 182 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/display/xe_display.c b/drivers/gpu/drm/xe/display/xe_display.c
+index 382c782..e16828f 100644
+--- a/drivers/gpu/drm/xe/display/xe_display.c
++++ b/drivers/gpu/drm/xe/display/xe_display.c
+@@ -38,11 +38,12 @@
+ #include "skl_watermark.h"
+ #include "xe_device.h"
+ #include "xe_display_bo.h"
+-#include "xe_fb_pin.h"
+ #include "xe_display_pcode.h"
+ #include "xe_display_rpm.h"
+ #include "xe_dsb_buffer.h"
+ #include "xe_fb_pin.h"
++#include "xe_gt_types.h"
++#include "xe_guc_pc.h"
+ #include "xe_frontbuffer.h"
+ #include "xe_hdcp_gsc.h"
+ #include "xe_initial_plane.h"
+@@ -160,6 +161,13 @@ static void xe_display_dpt_pool_fini(void *arg)
+ 	xe_fb_pin_dpt_pool_fini(arg);
+ }
+ 
++static void xe_display_boost_register(struct xe_device *xe, bool add);
++
++static void xe_display_boost_fini(void *arg)
++{
++	xe_display_boost_register(arg, false);
++}
++
+ int xe_display_init(struct xe_device *xe)
+ {
+ 	struct intel_display *display = xe->display;
+@@ -182,7 +190,13 @@ int xe_display_init(struct xe_device *xe)
+ 	if (err)
+ 		return err;
+ 
+-	return devm_add_action_or_reset(xe->drm.dev, xe_display_fini, xe);
++	err = devm_add_action_or_reset(xe->drm.dev, xe_display_fini, xe);
++	if (err)
++		return err;
++
++	/* Unregistered before display teardown, so no boost can race with it. */
++	xe_display_boost_register(xe, true);
++	return devm_add_action_or_reset(xe->drm.dev, xe_display_boost_fini, xe);
+ }
+ 
+ void xe_display_register(struct xe_device *xe)
+@@ -532,6 +546,65 @@ static bool has_auxccs(struct drm_device *drm)
+ 	return xe->info.platform == XE_ALDERLAKE_P;
+ }
+ 
++/*
++ * The rps boost hook only receives the fence, so keep track of the xe devices
++ * that drive a display. There is normally exactly one.
++ */
++#define XE_DISPLAY_BOOST_MAX_DEV 4
++static DEFINE_SPINLOCK(xe_display_boost_lock);
++static struct xe_device *xe_display_boost_dev[XE_DISPLAY_BOOST_MAX_DEV];
++
++static void xe_display_boost_register(struct xe_device *xe, bool add)
++{
++	unsigned long flags;
++	int i;
++
++	spin_lock_irqsave(&xe_display_boost_lock, flags);
++	for (i = 0; i < XE_DISPLAY_BOOST_MAX_DEV; i++) {
++		if (add && !xe_display_boost_dev[i]) {
++			xe_display_boost_dev[i] = xe;
++			break;
++		}
++		if (!add && xe_display_boost_dev[i] == xe)
++			xe_display_boost_dev[i] = NULL;
++	}
++	spin_unlock_irqrestore(&xe_display_boost_lock, flags);
++}
++
++static void xe_display_rps_boost_if_not_started(struct dma_fence *fence)
++{
++	unsigned long flags;
++	int i;
++
++	/* Called at the vblank after the flip was queued: still rendering? */
++	if (dma_fence_is_signaled(fence))
++		return;
++
++	spin_lock_irqsave(&xe_display_boost_lock, flags);
++	for (i = 0; i < XE_DISPLAY_BOOST_MAX_DEV; i++) {
++		struct xe_device *xe = xe_display_boost_dev[i];
++
++		if (xe)
++			xe_guc_pc_boost(&xe_root_mmio_gt(xe)->uc.guc.pc);
++	}
++	spin_unlock_irqrestore(&xe_display_boost_lock, flags);
++}
++
++static void xe_display_rps_mark_interactive(struct drm_device *drm, bool interactive)
++{
++	/* SLPC has no interactive bias; boosting covers missed frames. */
++}
++
++static void xe_display_rps_ilk_irq_handler(struct drm_device *drm)
++{
++}
++
++static const struct intel_display_rps_interface xe_display_rps_interface = {
++	.boost_if_not_started = xe_display_rps_boost_if_not_started,
++	.mark_interactive = xe_display_rps_mark_interactive,
++	.ilk_irq_handler = xe_display_rps_ilk_irq_handler,
++};
++
+ static const struct intel_display_parent_interface parent = {
+ 	.bo = &xe_display_bo_interface,
+ 	.dsb = &xe_display_dsb_interface,
+@@ -543,6 +616,7 @@ static const struct intel_display_parent_interface parent = {
+ 	.panic = &xe_display_panic_interface,
+ 	.pcode = &xe_display_pcode_interface,
+ 	.rpm = &xe_display_rpm_interface,
++	.rps = &xe_display_rps_interface,
+ 	.stolen = &xe_display_stolen_interface,
+ 	.has_auxccs = has_auxccs,
+ };
+diff --git a/drivers/gpu/drm/xe/xe_guc_pc.c b/drivers/gpu/drm/xe/xe_guc_pc.c
+index 7cf8f48..75b3771 100644
+--- a/drivers/gpu/drm/xe/xe_guc_pc.c
++++ b/drivers/gpu/drm/xe/xe_guc_pc.c
+@@ -32,6 +32,7 @@
+ #include "xe_guc_ct.h"
+ #include "xe_map.h"
+ #include "xe_mmio.h"
++#include "xe_module.h"
+ #include "xe_pcode.h"
+ #include "xe_pm.h"
+ #include "xe_sriov.h"
+@@ -1335,6 +1336,89 @@ void xe_guc_pc_stop(struct xe_guc_pc *pc)
+ 	mutex_unlock(&pc->freq_lock);
+ }
+ 
++/*
++ * Flip boost: the display calls xe_guc_pc_boost() when a page flip's rendering
++ * has not finished by the next vblank (the i915 "waitboost" hook, which xe did
++ * not implement). SLPC otherwise starts every burst of rendering from the
++ * efficient frequency and ramps only after several evaluation intervals.
++ * Raise the min freq to the max allowed freq and drop it again once no flip
++ * has missed for XE_GUC_PC_BOOST_HOLD_MS.
++ */
++#define XE_GUC_PC_BOOST_HOLD_MS	100
++
++static void xe_guc_pc_boost_work(struct work_struct *w)
++{
++	struct xe_guc_pc *pc = container_of(w, struct xe_guc_pc, boost_work);
++	u32 cur_min, target;
++
++	scoped_guard(mutex, &pc->freq_lock) {
++		if (!pc->freq_ready)
++			return;
++
++		if (!pc->boosted) {
++			target = pc->user_requested_max ?
++				 min(pc->rp0_freq, pc->user_requested_max) :
++				 pc->rp0_freq;
++
++			if (xe_guc_pc_get_min_freq_locked(pc, &cur_min))
++				return;
++			if (cur_min >= target)
++				return;
++			if (pc_set_min_freq(pc, target))
++				return;
++
++			pc->boost_saved_min = cur_min;
++			pc->boosted = true;
++		}
++	}
++
++	mod_delayed_work(system_unbound_wq, &pc->unboost_work,
++			 msecs_to_jiffies(XE_GUC_PC_BOOST_HOLD_MS));
++}
++
++static void xe_guc_pc_unboost_work(struct work_struct *w)
++{
++	struct xe_guc_pc *pc = container_of(to_delayed_work(w),
++					    struct xe_guc_pc, unboost_work);
++
++	guard(mutex)(&pc->freq_lock);
++
++	if (!pc->boosted)
++		return;
++
++	/* GuC not running (reset/suspend): try again once it is back. */
++	if (!pc->freq_ready) {
++		mod_delayed_work(system_unbound_wq, &pc->unboost_work,
++				 msecs_to_jiffies(XE_GUC_PC_BOOST_HOLD_MS));
++		return;
++	}
++
++	if (!pc_set_min_freq(pc, pc->user_requested_min ?: pc->boost_saved_min))
++		pc->boosted = false;
++	else
++		mod_delayed_work(system_unbound_wq, &pc->unboost_work,
++				 msecs_to_jiffies(XE_GUC_PC_BOOST_HOLD_MS));
++}
++
++/**
++ * xe_guc_pc_boost - Briefly raise the GT min frequency
++ * @pc: Xe_GuC_PC instance
++ *
++ * Safe to call from any context, including hard IRQ.
++ */
++void xe_guc_pc_boost(struct xe_guc_pc *pc)
++{
++	struct xe_device *xe = pc_to_xe(pc);
++
++	if (xe->info.skip_guc_pc || !READ_ONCE(xe_modparam.flip_boost))
++		return;
++
++	if (READ_ONCE(pc->power_profile) == SLPC_POWER_PROFILE_POWER_SAVING)
++		return;
++
++	queue_work(system_unbound_wq, &pc->boost_work);
++}
++
+ /**
+  * xe_guc_pc_fini_hw - Finalize GuC's Power Conservation component
+  * @arg: opaque pointer that should point to Xe_GuC_PC instance
+@@ -1344,6 +1428,9 @@ static void xe_guc_pc_fini_hw(void *arg)
+ 	struct xe_guc_pc *pc = arg;
+ 	struct xe_device *xe = pc_to_xe(pc);
+ 
++	cancel_work_sync(&pc->boost_work);
++	cancel_delayed_work_sync(&pc->unboost_work);
++
+ 	if (xe_device_wedged(xe))
+ 		return;
+ 
+@@ -1386,6 +1473,9 @@ int xe_guc_pc_init(struct xe_guc_pc *pc)
+ 
+ 	pc->power_profile = SLPC_POWER_PROFILE_BASE;
+ 
++	INIT_WORK(&pc->boost_work, xe_guc_pc_boost_work);
++	INIT_DELAYED_WORK(&pc->unboost_work, xe_guc_pc_unboost_work);
++
+ 	return devm_add_action_or_reset(xe->drm.dev, xe_guc_pc_fini_hw, pc);
+ }
+ 
+diff --git a/drivers/gpu/drm/xe/xe_guc_pc.h b/drivers/gpu/drm/xe/xe_guc_pc.h
+index 1025a2b..b3fc2c7 100644
+--- a/drivers/gpu/drm/xe/xe_guc_pc.h
++++ b/drivers/gpu/drm/xe/xe_guc_pc.h
+@@ -40,5 +40,6 @@ int xe_guc_pc_restore_stashed_freq(struct xe_guc_pc *pc);
+ void xe_guc_pc_raise_unslice(struct xe_guc_pc *pc);
+ void xe_guc_pc_apply_flush_freq_limit(struct xe_guc_pc *pc);
+ void xe_guc_pc_remove_flush_freq_limit(struct xe_guc_pc *pc);
++void xe_guc_pc_boost(struct xe_guc_pc *pc);
+ 
+ #endif /* _XE_GUC_PC_H_ */
+diff --git a/drivers/gpu/drm/xe/xe_guc_pc_types.h b/drivers/gpu/drm/xe/xe_guc_pc_types.h
+index 711bbcd..0c43caa 100644
+--- a/drivers/gpu/drm/xe/xe_guc_pc_types.h
++++ b/drivers/gpu/drm/xe/xe_guc_pc_types.h
+@@ -7,6 +7,7 @@
+ #define _XE_GUC_PC_TYPES_H_
+ 
+ #include <linux/mutex.h>
++#include <linux/workqueue_types.h>
+ #include <linux/types.h>
+ 
+ /**
+@@ -35,6 +36,14 @@ struct xe_guc_pc {
+ 	bool freq_ready;
+ 	/** @power_profile: Base or power_saving profile */
+ 	u32 power_profile;
++	/** @boost_work: raises the min freq after a missed page flip */
++	struct work_struct boost_work;
++	/** @unboost_work: restores the min freq once flips stop missing */
++	struct delayed_work unboost_work;
++	/** @boosted: min freq is currently raised by @boost_work, under @freq_lock */
++	bool boosted;
++	/** @boost_saved_min: min freq in effect before boosting, under @freq_lock */
++	u32 boost_saved_min;
+ };
+ 
+ #endif	/* _XE_GUC_PC_TYPES_H_ */
+diff --git a/drivers/gpu/drm/xe/xe_module.c b/drivers/gpu/drm/xe/xe_module.c
+index 99347f2..335347c 100644
+--- a/drivers/gpu/drm/xe/xe_module.c
++++ b/drivers/gpu/drm/xe/xe_module.c
+@@ -30,6 +30,7 @@ struct xe_modparam xe_modparam = {
+ #endif
+ 	.wedged_mode =		XE_DEFAULT_WEDGED_MODE,
+ 	.svm_notifier_size =	XE_DEFAULT_SVM_NOTIFIER_SIZE,
++	.flip_boost =		true,
+ 	/* the rest are 0 by default */
+ };
+ 
+@@ -37,6 +38,10 @@ module_param_named(svm_notifier_size, xe_modparam.svm_notifier_size, uint, 0600)
+ MODULE_PARM_DESC(svm_notifier_size, "Set the svm notifier size in MiB, must be power of 2 "
+ 		 "[default=" __stringify(XE_DEFAULT_SVM_NOTIFIER_SIZE) "]");
+ 
++module_param_named(flip_boost, xe_modparam.flip_boost, bool, 0600);
++MODULE_PARM_DESC(flip_boost, "Briefly raise the GPU min frequency when a page flip misses "
++		 "vblank because rendering has not finished [default=true]");
++
+ module_param_named_unsafe(force_execlist, xe_modparam.force_execlist, bool, 0444);
+ MODULE_PARM_DESC(force_execlist, "Force Execlist submission");
+ 
+diff --git a/drivers/gpu/drm/xe/xe_module.h b/drivers/gpu/drm/xe/xe_module.h
+index e8e54f7..aa4bda0 100644
+--- a/drivers/gpu/drm/xe/xe_module.h
++++ b/drivers/gpu/drm/xe/xe_module.h
+@@ -25,6 +25,7 @@ struct xe_modparam {
+ #endif
+ 	unsigned int wedged_mode;
+ 	u32 svm_notifier_size;
++	bool flip_boost;
+ };
+ 
+ extern struct xe_modparam xe_modparam;
+-- 
+2.55.0
+

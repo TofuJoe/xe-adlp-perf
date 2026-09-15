@@ -1,0 +1,7 @@
+build/
+dl/
+*.ko
+*.priv
+*.key
+*.pem
+*.der

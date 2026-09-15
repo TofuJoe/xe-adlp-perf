@@ -1,0 +1,121 @@
+From aa7d907035d3aab9d99884af34a104c719cddd42 Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Mon, 14 Sep 2026 23:01:49 -0600
+Subject: [PATCH 17/22] drm/xe: Move shared BOs to the LRU tail on exec
+
+exec only bulk-moves VM-private BOs to the LRU tail. Exported and imported
+BOs (compositor swapchains, browser shared images, video surfaces) kept
+their creation-time LRU position, so under memory pressure the shrinker
+picked them first although they are used every frame.
+
+After pushing the job, move every locked xe BO whose resv is not the VM resv
+to the LRU tail, at most once per jiffy per BO.
+
+Assisted-by: Claude:claude-opus-5
+---
+ drivers/gpu/drm/xe/xe_bo.c       | 12 ++++++++++++
+ drivers/gpu/drm/xe/xe_bo.h       |  1 +
+ drivers/gpu/drm/xe/xe_bo_types.h |  6 ++++++
+ drivers/gpu/drm/xe/xe_exec.c     | 25 +++++++++++++++++++++++++
+ 4 files changed, 44 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_bo.c b/drivers/gpu/drm/xe/xe_bo.c
+index f8ab46b..b636a19 100644
+--- a/drivers/gpu/drm/xe/xe_bo.c
++++ b/drivers/gpu/drm/xe/xe_bo.c
+@@ -3214,6 +3214,18 @@ int xe_bo_validate(struct xe_bo *bo, struct xe_vm *vm, bool allow_res_evict,
+ 	return ret;
+ }
+ 
++/**
++ * xe_gem_is_xe_bo() - Whether a GEM object is an xe BO
++ * @obj: The GEM object
++ *
++ * Unlike xe_bo_is_xe_bo(), safe on any GEM object, including the drm_gpuvm
++ * resv object, which is not embedded in a TTM BO.
++ */
++bool xe_gem_is_xe_bo(struct drm_gem_object *obj)
++{
++	return obj->funcs == &xe_gem_object_funcs;
++}
++
+ bool xe_bo_is_xe_bo(struct ttm_buffer_object *bo)
+ {
+ 	if (bo->destroy == &xe_ttm_bo_destroy)
+diff --git a/drivers/gpu/drm/xe/xe_bo.h b/drivers/gpu/drm/xe/xe_bo.h
+index 964c016..97f1ff1 100644
+--- a/drivers/gpu/drm/xe/xe_bo.h
++++ b/drivers/gpu/drm/xe/xe_bo.h
+@@ -372,6 +372,7 @@ static inline void xe_bo_unpin_map_no_vm(struct xe_bo *bo)
+ }
+ 
+ bool xe_bo_is_xe_bo(struct ttm_buffer_object *bo);
++bool xe_gem_is_xe_bo(struct drm_gem_object *obj);
+ void xe_bo_addr_iter_first(struct xe_bo *bo, struct xe_res_cursor *cur, u64 offset, u64 size);
+ dma_addr_t xe_bo_addr_iter_addr(struct xe_res_cursor *cur);
+ dma_addr_t __xe_bo_addr(struct xe_bo *bo, u64 offset, size_t page_size);
+diff --git a/drivers/gpu/drm/xe/xe_bo_types.h b/drivers/gpu/drm/xe/xe_bo_types.h
+index ff90eed..add3409 100644
+--- a/drivers/gpu/drm/xe/xe_bo_types.h
++++ b/drivers/gpu/drm/xe/xe_bo_types.h
+@@ -119,6 +119,12 @@ struct xe_bo {
+ 	 */
+ 	u64 backing_gen;
+ 
++	/**
++	 * @lru_refresh_jiffies: when exec last moved this shared BO to the
++	 * LRU tail, to do it at most once per jiffy. Updated under the BO resv.
++	 */
++	unsigned long lru_refresh_jiffies;
++
+ 	/**
+ 	 * @purgeable: Purgeability state and accounting.
+ 	 *
+diff --git a/drivers/gpu/drm/xe/xe_exec.c b/drivers/gpu/drm/xe/xe_exec.c
+index 7a9e4cc..78c0fc1 100644
+--- a/drivers/gpu/drm/xe/xe_exec.c
++++ b/drivers/gpu/drm/xe/xe_exec.c
+@@ -11,6 +11,7 @@
+ #include <uapi/drm/xe_drm.h>
+ #include <linux/delay.h>
+ 
++#include "xe_bo.h"
+ #include "xe_device.h"
+ #include "xe_exec_queue.h"
+ #include "xe_hw_engine_group.h"
+@@ -357,8 +358,32 @@ retry:
+ 	xe_vm_reactivate_rebind(vm);
+ 
+ 	if (!err && !xe_vm_in_lr_mode(vm)) {
++		struct drm_gem_object *obj;
++		unsigned long now = jiffies;
++
+ 		spin_lock(&xe->ttm.lru_lock);
+ 		ttm_lru_bulk_move_tail(&vm->lru_bulk_move);
++		/*
++		 * The bulk move only covers VM-private BOs. Shared BOs (exported
++		 * or imported dma-bufs: compositor swapchains, browser shared
++		 * images, video surfaces) otherwise keep their creation-time
++		 * LRU position and are the first thing the shrinker evicts, even
++		 * though they are used every frame. All of them are locked by
++		 * this exec, as ttm_bo_move_to_lru_tail() requires.
++		 */
++		drm_exec_for_each_locked_object(exec, obj) {
++			struct xe_bo *bo;
++
++			if (obj->resv == xe_vm_resv(vm) || !xe_gem_is_xe_bo(obj))
++				continue;
++
++			bo = gem_to_xe_bo(obj);
++			if (bo->lru_refresh_jiffies == now)
++				continue;
++
++			bo->lru_refresh_jiffies = now;
++			ttm_bo_move_to_lru_tail(&bo->ttm);
++		}
+ 		spin_unlock(&xe->ttm.lru_lock);
+ 	} else if (!err && dma_resv_trylock(xe_vm_resv(vm))) {
+ 		/*
+-- 
+2.55.0
+

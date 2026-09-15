@@ -1,0 +1,458 @@
+From 68934ae9b1e65d46f8fcb09e0eb3e705d7554dd5 Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Mon, 14 Sep 2026 21:15:19 -0600
+Subject: [PATCH 14/22] drm/xe/display: Pool DSB buffers and skip unchanged DPT
+ rewrites
+
+On an external DP output each commit created and destroyed a DSB command
+buffer BO (~71 us + ~38 us measured at 5K). Pool up to four released DSB
+BOs; a reused one is cleared.
+
+At 5K each flip also cleared and rewrote the ~17k-entry DPT of a pooled BO
+(~110 us). Pool entries now remember the fb BO backing generation, PTE
+flags and GTT view they were written for; when the same key is pinned
+again the pooled DPT is used as is. Any backing change of the fb BO renews
+its generation, so a stale DPT is never reused.
+
+The pool alignment check now matches the GGTT allocator, which aligns node
+offsets relative to the GGTT start.
+
+Assisted-by: Claude:claude-opus-5
+---
+ drivers/gpu/drm/xe/display/xe_display.c     |   6 +-
+ drivers/gpu/drm/xe/display/xe_display_vma.h |   6 ++
+ drivers/gpu/drm/xe/display/xe_dsb_buffer.c  |  87 +++++++++++++++--
+ drivers/gpu/drm/xe/display/xe_dsb_buffer.h  |   5 +
+ drivers/gpu/drm/xe/display/xe_fb_pin.c      | 101 +++++++++++++++-----
+ drivers/gpu/drm/xe/display/xe_fb_pin.h      |   2 +-
+ drivers/gpu/drm/xe/xe_device_types.h        |  19 +++-
+ 7 files changed, 188 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/display/xe_display.c b/drivers/gpu/drm/xe/display/xe_display.c
+index e16828f..9654396 100644
+--- a/drivers/gpu/drm/xe/display/xe_display.c
++++ b/drivers/gpu/drm/xe/display/xe_display.c
+@@ -158,6 +158,7 @@ static void xe_display_fini(void *arg)
+ 
+ static void xe_display_dpt_pool_fini(void *arg)
+ {
++	xe_dsb_buffer_pool_fini(arg);
+ 	xe_fb_pin_dpt_pool_fini(arg);
+ }
+ 
+@@ -181,7 +182,10 @@ int xe_display_init(struct xe_device *xe)
+ 	 * teardown has unpinned (and pooled) every DPT, and before the GGTT
+ 	 * goes away.
+ 	 */
+-	xe_fb_pin_dpt_pool_init(xe);
++	xe_dsb_buffer_pool_init(xe);
++	err = xe_fb_pin_dpt_pool_init(xe);
++	if (err)
++		return err;
+ 	err = devm_add_action_or_reset(xe->drm.dev, xe_display_dpt_pool_fini, xe);
+ 	if (err)
+ 		return err;
+diff --git a/drivers/gpu/drm/xe/display/xe_display_vma.h b/drivers/gpu/drm/xe/display/xe_display_vma.h
+index 28267be..23b1c36 100644
+--- a/drivers/gpu/drm/xe/display/xe_display_vma.h
++++ b/drivers/gpu/drm/xe/display/xe_display_vma.h
+@@ -6,6 +6,8 @@
+ 
+ #include <linux/refcount.h>
+ 
++#include "i915_gtt_view_types.h"
++
+ struct xe_bo;
+ struct xe_ggtt_node;
+ 
+@@ -13,6 +15,10 @@ struct i915_vma {
+ 	refcount_t ref;
+ 	struct xe_bo *bo, *dpt;
+ 	struct xe_ggtt_node *node;
++	/* What @dpt was written for, handed to the DPT pool on unpin. */
++	u64 dpt_src_gen;
++	u64 dpt_pte;
++	struct i915_gtt_view dpt_view;
+ };
+ 
+ #endif
+diff --git a/drivers/gpu/drm/xe/display/xe_dsb_buffer.c b/drivers/gpu/drm/xe/display/xe_dsb_buffer.c
+index a7158c7..4d6f5d4 100644
+--- a/drivers/gpu/drm/xe/display/xe_dsb_buffer.c
++++ b/drivers/gpu/drm/xe/display/xe_dsb_buffer.c
+@@ -38,6 +38,70 @@ static void xe_dsb_buffer_fill(struct intel_dsb_buffer *dsb_buf, u32 idx, u32 va
+ 	iosys_map_memset(&dsb_buf->bo->vmap, idx * 4, val, size);
+ }
+ 
++/*
++ * DSB command buffers are created and destroyed for every commit on outputs
++ * that use DSB (measured ~110 us per commit on a 5K DP output). Keep a few
++ * released ones pinned and mapped for reuse; a reused one is cleared so it
++ * looks exactly like a fresh BO.
++ */
++void xe_dsb_buffer_pool_init(struct xe_device *xe)
++{
++	spin_lock_init(&xe->dsb_pool.lock);
++}
++
++void xe_dsb_buffer_pool_fini(struct xe_device *xe)
++{
++	struct xe_bo *bo[XE_DSB_POOL_SIZE];
++	int i;
++
++	spin_lock(&xe->dsb_pool.lock);
++	for (i = 0; i < XE_DSB_POOL_SIZE; i++) {
++		bo[i] = xe->dsb_pool.bo[i];
++		xe->dsb_pool.bo[i] = NULL;
++	}
++	spin_unlock(&xe->dsb_pool.lock);
++
++	for (i = 0; i < XE_DSB_POOL_SIZE; i++)
++		if (bo[i])
++			xe_bo_unpin_map_no_vm(bo[i]);
++}
++
++static struct xe_bo *dsb_pool_get(struct xe_device *xe, size_t size)
++{
++	struct xe_bo *bo = NULL;
++	int i;
++
++	spin_lock(&xe->dsb_pool.lock);
++	for (i = 0; i < XE_DSB_POOL_SIZE; i++) {
++		if (xe->dsb_pool.bo[i] && xe_bo_size(xe->dsb_pool.bo[i]) == size) {
++			bo = xe->dsb_pool.bo[i];
++			xe->dsb_pool.bo[i] = NULL;
++			break;
++		}
++	}
++	spin_unlock(&xe->dsb_pool.lock);
++
++	return bo;
++}
++
++static void dsb_pool_put(struct xe_device *xe, struct xe_bo *bo)
++{
++	int i;
++
++	spin_lock(&xe->dsb_pool.lock);
++	for (i = 0; i < XE_DSB_POOL_SIZE; i++) {
++		if (!xe->dsb_pool.bo[i]) {
++			xe->dsb_pool.bo[i] = bo;
++			bo = NULL;
++			break;
++		}
++	}
++	spin_unlock(&xe->dsb_pool.lock);
++
++	if (bo)
++		xe_bo_unpin_map_no_vm(bo);
++}
++
+ static struct intel_dsb_buffer *xe_dsb_buffer_create(struct drm_device *drm, size_t size)
+ {
+ 	struct xe_device *xe = to_xe_device(drm);
+@@ -49,14 +113,19 @@ static struct intel_dsb_buffer *xe_dsb_buffer_create(struct drm_device *drm, siz
+ 	if (!dsb_buf)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	/* Set scanout flag for WC mapping */
+-	obj = xe_bo_create_pin_map_novm(xe, xe_device_get_root_tile(xe),
+-					PAGE_ALIGN(size),
+-					ttm_bo_type_kernel,
+-					XE_BO_FLAG_VRAM_IF_DGFX(xe_device_get_root_tile(xe)) |
+-					XE_BO_FLAG_FORCE_WC |
+-					XE_BO_FLAG_GGTT,
+-					false);
++	obj = dsb_pool_get(xe, PAGE_ALIGN(size));
++	if (obj) {
++		iosys_map_memset(&obj->vmap, 0, 0, xe_bo_size(obj));
++	} else {
++		/* Set scanout flag for WC mapping */
++		obj = xe_bo_create_pin_map_novm(xe, xe_device_get_root_tile(xe),
++						PAGE_ALIGN(size),
++						ttm_bo_type_kernel,
++						XE_BO_FLAG_VRAM_IF_DGFX(xe_device_get_root_tile(xe)) |
++						XE_BO_FLAG_FORCE_WC |
++						XE_BO_FLAG_GGTT,
++						false);
++	}
+ 	if (IS_ERR(obj)) {
+ 		ret = PTR_ERR(obj);
+ 		goto err_pin_map;
+@@ -75,7 +144,7 @@ err_pin_map:
+ 
+ static void xe_dsb_buffer_cleanup(struct intel_dsb_buffer *dsb_buf)
+ {
+-	xe_bo_unpin_map_no_vm(dsb_buf->bo);
++	dsb_pool_put(xe_bo_device(dsb_buf->bo), dsb_buf->bo);
+ 	kfree(dsb_buf);
+ }
+ 
+diff --git a/drivers/gpu/drm/xe/display/xe_dsb_buffer.h b/drivers/gpu/drm/xe/display/xe_dsb_buffer.h
+index 2e47721..c549df7 100644
+--- a/drivers/gpu/drm/xe/display/xe_dsb_buffer.h
++++ b/drivers/gpu/drm/xe/display/xe_dsb_buffer.h
+@@ -4,6 +4,11 @@
+ #ifndef __XE_DSB_BUFFER_H__
+ #define __XE_DSB_BUFFER_H__
+ 
++struct xe_device;
++
+ extern const struct intel_display_dsb_interface xe_display_dsb_interface;
+ 
++void xe_dsb_buffer_pool_init(struct xe_device *xe);
++void xe_dsb_buffer_pool_fini(struct xe_device *xe);
++
+ #endif
+diff --git a/drivers/gpu/drm/xe/display/xe_fb_pin.c b/drivers/gpu/drm/xe/display/xe_fb_pin.c
+index 2774a4e..0f6dbbf 100644
+--- a/drivers/gpu/drm/xe/display/xe_fb_pin.c
++++ b/drivers/gpu/drm/xe/display/xe_fb_pin.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <drm/intel/display_parent_interface.h>
++#include <drm/drm_managed.h>
+ #include <drm/ttm/ttm_bo.h>
+ 
+ /* FIXME move the types to parent interface? */
+@@ -193,9 +194,20 @@ write_dpt_remapped(struct xe_bo *bo,
+  * them back out. The contents are cleared and fully rewritten from the current
+  * framebuffer backing store on every pin, so nothing stale survives.
+  */
+-void xe_fb_pin_dpt_pool_init(struct xe_device *xe)
++struct xe_dpt_pool_entry {
++	struct xe_bo *bo;
++	/* xe_bo_backing_gen() of the fb BO the entries were written from */
++	u64 src_gen;
++	u64 pte;
++	struct i915_gtt_view view;
++};
++
++int xe_fb_pin_dpt_pool_init(struct xe_device *xe)
+ {
+ 	spin_lock_init(&xe->dpt_pool.lock);
++	xe->dpt_pool.entry = drmm_kcalloc(&xe->drm, XE_DPT_POOL_SIZE,
++					  sizeof(*xe->dpt_pool.entry), GFP_KERNEL);
++	return xe->dpt_pool.entry ? 0 : -ENOMEM;
+ }
+ 
+ void xe_fb_pin_dpt_pool_fini(struct xe_device *xe)
+@@ -203,10 +215,13 @@ void xe_fb_pin_dpt_pool_fini(struct xe_device *xe)
+ 	struct xe_bo *bo[XE_DPT_POOL_SIZE];
+ 	int i;
+ 
++	if (!xe->dpt_pool.entry)
++		return;
++
+ 	spin_lock(&xe->dpt_pool.lock);
+ 	for (i = 0; i < XE_DPT_POOL_SIZE; i++) {
+-		bo[i] = xe->dpt_pool.bo[i];
+-		xe->dpt_pool.bo[i] = NULL;
++		bo[i] = xe->dpt_pool.entry[i].bo;
++		xe->dpt_pool.entry[i].bo = NULL;
+ 	}
+ 	spin_unlock(&xe->dpt_pool.lock);
+ 
+@@ -215,40 +230,66 @@ void xe_fb_pin_dpt_pool_fini(struct xe_device *xe)
+ 			xe_bo_unpin_map_no_vm(bo[i]);
+ }
+ 
+-static struct xe_bo *dpt_pool_get(struct xe_device *xe, u8 tile_id,
+-				  size_t size, u32 alignment)
++/*
++ * Take a pooled DPT BO of @size whose GGTT node satisfies @alignment (checked
++ * the way the GGTT allocator applies it, relative to the GGTT start). Prefer
++ * one that already holds the entries for (@src_gen, @pte, @view); *@valid
++ * tells whether the returned BO can be used without rewriting it.
++ */
++static struct xe_bo *dpt_pool_get(struct xe_device *xe, struct xe_tile *tile,
++				  size_t size, u32 alignment, u64 src_gen,
++				  u64 pte, const struct i915_gtt_view *view,
++				  bool *valid)
+ {
++	struct xe_ggtt *ggtt = tile->mem.ggtt;
+ 	struct xe_bo *bo = NULL;
+-	int i;
++	int i, pick = -1;
++
++	*valid = false;
+ 
+ 	spin_lock(&xe->dpt_pool.lock);
+ 	for (i = 0; i < XE_DPT_POOL_SIZE; i++) {
+-		struct xe_bo *cand = xe->dpt_pool.bo[i];
++		struct xe_dpt_pool_entry *e = &xe->dpt_pool.entry[i];
+ 
+-		if (!cand || xe_bo_size(cand) != size)
++		if (!e->bo || xe_bo_size(e->bo) != size)
+ 			continue;
+ 		if (alignment &&
+-		    !IS_ALIGNED(xe_ggtt_node_addr(cand->ggtt_node[tile_id]),
+-				alignment))
++		    !IS_ALIGNED(xe_ggtt_node_addr(e->bo->ggtt_node[tile->id]) -
++				xe_ggtt_start(ggtt), alignment))
+ 			continue;
+ 
+-		bo = cand;
+-		xe->dpt_pool.bo[i] = NULL;
+-		break;
++		if (e->src_gen == src_gen && e->pte == pte &&
++		    !memcmp(&e->view, view, sizeof(*view))) {
++			pick = i;
++			*valid = true;
++			break;
++		}
++		if (pick < 0)
++			pick = i;
++	}
++	if (pick >= 0) {
++		bo = xe->dpt_pool.entry[pick].bo;
++		xe->dpt_pool.entry[pick].bo = NULL;
+ 	}
+ 	spin_unlock(&xe->dpt_pool.lock);
+ 
+ 	return bo;
+ }
+ 
+-static void dpt_pool_put(struct xe_device *xe, struct xe_bo *dpt)
++static void dpt_pool_put(struct xe_device *xe, struct i915_vma *vma)
+ {
++	struct xe_bo *dpt = vma->dpt;
+ 	int i;
+ 
+ 	spin_lock(&xe->dpt_pool.lock);
+-	for (i = 0; i < XE_DPT_POOL_SIZE; i++) {
+-		if (!xe->dpt_pool.bo[i]) {
+-			xe->dpt_pool.bo[i] = dpt;
++	for (i = 0; xe->dpt_pool.entry && i < XE_DPT_POOL_SIZE; i++) {
++		struct xe_dpt_pool_entry *e = &xe->dpt_pool.entry[i];
++
++		if (!e->bo) {
++			e->bo = dpt;
++			e->src_gen = vma->dpt_src_gen;
++			e->pte = vma->dpt_pte;
++			e->view = vma->dpt_view;
+ 			dpt = NULL;
+ 			break;
+ 		}
+@@ -269,6 +310,8 @@ static int __xe_pin_fb_vma_dpt(struct drm_gem_object *obj,
+ 	const struct i915_gtt_view *view = pin_params->view;
+ 	struct xe_bo *bo = gem_to_xe_bo(obj), *dpt;
+ 	u32 dpt_size, size = bo->ttm.base.size;
++	u64 src_gen, pte;
++	bool valid;
+ 
+ 	if (view->type == I915_GTT_VIEW_NORMAL)
+ 		dpt_size = ALIGN(size / XE_PAGE_SIZE * 8, XE_PAGE_SIZE);
+@@ -280,11 +323,19 @@ static int __xe_pin_fb_vma_dpt(struct drm_gem_object *obj,
+ 		dpt_size = ALIGN(intel_rotation_info_size(&view->rotated) * 8,
+ 				 XE_PAGE_SIZE);
+ 
+-	dpt = dpt_pool_get(xe, tile0->id, dpt_size, pin_params->alignment);
+-	if (dpt) {
++	/*
++	 * The fb BO is pinned by the caller, so its backing generation can't
++	 * change while the DPT is being filled from it.
++	 */
++	src_gen = xe_bo_backing_gen(bo);
++	pte = xe_ggtt_encode_pte_flags(ggtt, bo, xe_cache_pat_idx(xe, XE_CACHE_NONE));
++
++	dpt = dpt_pool_get(xe, tile0, dpt_size, pin_params->alignment,
++			   src_gen, pte, view, &valid);
++	if (dpt && !valid) {
+ 		/* A fresh BO starts zeroed; padding entries are never written. */
+ 		iosys_map_memset(&dpt->vmap, 0, 0, dpt_size);
+-	} else {
++	} else if (!dpt) {
+ 		dpt = xe_bo_create_pin_map_at_novm(xe, tile0,
+ 						   dpt_size,  ~0ull,
+ 						   ttm_bo_type_kernel,
+@@ -297,8 +348,9 @@ static int __xe_pin_fb_vma_dpt(struct drm_gem_object *obj,
+ 			return PTR_ERR(dpt);
+ 	}
+ 
+-	if (view->type == I915_GTT_VIEW_NORMAL) {
+-		u64 pte = xe_ggtt_encode_pte_flags(ggtt, bo, xe_cache_pat_idx(xe, XE_CACHE_NONE));
++	if (valid) {
++		/* Same fb backing, flags and view as last written: nothing to do. */
++	} else if (view->type == I915_GTT_VIEW_NORMAL) {
+ 		u32 x;
+ 
+ 		for (x = 0; x < size / XE_PAGE_SIZE; x++) {
+@@ -323,6 +375,9 @@ static int __xe_pin_fb_vma_dpt(struct drm_gem_object *obj,
+ 
+ 	vma->dpt = dpt;
+ 	vma->node = dpt->ggtt_node[tile0->id];
++	vma->dpt_src_gen = src_gen;
++	vma->dpt_pte = pte;
++	vma->dpt_view = *view;
+ 
+ 	/* Ensure DPT writes are flushed */
+ 	xe_device_l2_flush(xe);
+@@ -510,7 +565,7 @@ static void __xe_unpin_fb_vma(struct i915_vma *vma)
+ 		return;
+ 
+ 	if (vma->dpt)
+-		dpt_pool_put(xe_bo_device(vma->bo), vma->dpt);
++		dpt_pool_put(xe_bo_device(vma->bo), vma);
+ 	else if (vma->bo->ggtt_node[tile_id] != vma->node)
+ 		xe_ggtt_node_remove(vma->node, false);
+ 
+diff --git a/drivers/gpu/drm/xe/display/xe_fb_pin.h b/drivers/gpu/drm/xe/display/xe_fb_pin.h
+index 8d75371..d0e6a2a 100644
+--- a/drivers/gpu/drm/xe/display/xe_fb_pin.h
++++ b/drivers/gpu/drm/xe/display/xe_fb_pin.h
+@@ -20,7 +20,7 @@ extern const struct intel_display_fb_pin_interface xe_display_fb_pin_interface;
+ 
+ struct xe_device;
+ 
+-void xe_fb_pin_dpt_pool_init(struct xe_device *xe);
++int xe_fb_pin_dpt_pool_init(struct xe_device *xe);
+ void xe_fb_pin_dpt_pool_fini(struct xe_device *xe);
+ 
+ #endif /* __XE_FB_PIN_H__ */
+diff --git a/drivers/gpu/drm/xe/xe_device_types.h b/drivers/gpu/drm/xe/xe_device_types.h
+index bfab800..fed8638 100644
+--- a/drivers/gpu/drm/xe/xe_device_types.h
++++ b/drivers/gpu/drm/xe/xe_device_types.h
+@@ -35,6 +35,7 @@
+ #define TEST_VM_OPS_ERROR
+ #endif
+ 
++struct xe_dpt_pool_entry;
+ struct drm_pagemap_shrinker;
+ struct intel_display;
+ struct intel_dg_nvm_dev;
+@@ -574,15 +575,25 @@ struct xe_device {
+ 	/**
+ 	 * @dpt_pool: recently released DPT BOs, still pinned, mapped and bound
+ 	 * in the GGTT, reused by the next DPT pin of the same size/alignment so
+-	 * that page flips don't create and destroy a BO every frame.
++	 * that page flips don't create and destroy a BO every frame. Entries
++	 * remember what they were written for, so the rewrite can be skipped.
+ 	 */
+ 	struct {
+-		/** @dpt_pool.lock: protects @dpt_pool.bo */
++		/** @dpt_pool.lock: protects @dpt_pool.entry */
+ 		spinlock_t lock;
+ #define XE_DPT_POOL_SIZE 4
+-		/** @dpt_pool.bo: cached DPT BOs, NULL for empty slots */
+-		struct xe_bo *bo[XE_DPT_POOL_SIZE];
++		/** @dpt_pool.entry: XE_DPT_POOL_SIZE entries, see xe_fb_pin.c */
++		struct xe_dpt_pool_entry *entry;
+ 	} dpt_pool;
++
++	/** @dsb_pool: recently released DSB command buffer BOs, as @dpt_pool */
++	struct {
++		/** @dsb_pool.lock: protects @dsb_pool.bo */
++		spinlock_t lock;
++#define XE_DSB_POOL_SIZE 4
++		/** @dsb_pool.bo: cached DSB BOs, NULL for empty slots */
++		struct xe_bo *bo[XE_DSB_POOL_SIZE];
++	} dsb_pool;
+ #endif
+ };
+ 
+-- 
+2.55.0
+

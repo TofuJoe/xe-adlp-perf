@@ -1,0 +1,66 @@
+From 013dd916c5cc8d5cb31fe2043517dafdcf13e3a2 Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Mon, 14 Sep 2026 21:32:24 -0600
+Subject: [PATCH 15/22] drm/xe/display: Size DPT/DSB pools for two active
+ outputs, fix comments
+
+With eDP and an external output both active, each cycling ~3 buffers, four
+slots per pool can overflow and fall back to create/destroy. Use eight.
+Also update two comments made stale by the DPT rewrite skip (review).
+
+Assisted-by: Claude:claude-opus-5
+---
+ drivers/gpu/drm/xe/display/xe_fb_pin.c | 7 ++++---
+ drivers/gpu/drm/xe/xe_device_types.h   | 4 ++--
+ 2 files changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/display/xe_fb_pin.c b/drivers/gpu/drm/xe/display/xe_fb_pin.c
+index 0f6dbbf..62de9f6 100644
+--- a/drivers/gpu/drm/xe/display/xe_fb_pin.c
++++ b/drivers/gpu/drm/xe/display/xe_fb_pin.c
+@@ -191,8 +191,9 @@ write_dpt_remapped(struct xe_bo *bo,
+  * allocation, vmap, GGTT insert) and destroy the previous one, because the
+  * compositor alternates between framebuffers and xe_fb_pin_reuse_vma() only
+  * matches the same one. Keep a few released DPT BOs pinned and mapped, and hand
+- * them back out. The contents are cleared and fully rewritten from the current
+- * framebuffer backing store on every pin, so nothing stale survives.
++ * them back out. A pooled DPT is used unchanged only if it was written for the
++ * same fb BO backing generation, PTE flags and view; otherwise it is cleared
++ * and fully rewritten from the current backing store.
+  */
+ struct xe_dpt_pool_entry {
+ 	struct xe_bo *bo;
+@@ -333,7 +334,7 @@ static int __xe_pin_fb_vma_dpt(struct drm_gem_object *obj,
+ 	dpt = dpt_pool_get(xe, tile0, dpt_size, pin_params->alignment,
+ 			   src_gen, pte, view, &valid);
+ 	if (dpt && !valid) {
+-		/* A fresh BO starts zeroed; padding entries are never written. */
++		/* Padding entries are never written and ignored by the DE; clear stale ones anyway. */
+ 		iosys_map_memset(&dpt->vmap, 0, 0, dpt_size);
+ 	} else if (!dpt) {
+ 		dpt = xe_bo_create_pin_map_at_novm(xe, tile0,
+diff --git a/drivers/gpu/drm/xe/xe_device_types.h b/drivers/gpu/drm/xe/xe_device_types.h
+index fed8638..69a853c 100644
+--- a/drivers/gpu/drm/xe/xe_device_types.h
++++ b/drivers/gpu/drm/xe/xe_device_types.h
+@@ -581,7 +581,7 @@ struct xe_device {
+ 	struct {
+ 		/** @dpt_pool.lock: protects @dpt_pool.entry */
+ 		spinlock_t lock;
+-#define XE_DPT_POOL_SIZE 4
++#define XE_DPT_POOL_SIZE 8
+ 		/** @dpt_pool.entry: XE_DPT_POOL_SIZE entries, see xe_fb_pin.c */
+ 		struct xe_dpt_pool_entry *entry;
+ 	} dpt_pool;
+@@ -590,7 +590,7 @@ struct xe_device {
+ 	struct {
+ 		/** @dsb_pool.lock: protects @dsb_pool.bo */
+ 		spinlock_t lock;
+-#define XE_DSB_POOL_SIZE 4
++#define XE_DSB_POOL_SIZE 8
+ 		/** @dsb_pool.bo: cached DSB BOs, NULL for empty slots */
+ 		struct xe_bo *bo[XE_DSB_POOL_SIZE];
+ 	} dsb_pool;
+-- 
+2.55.0
+

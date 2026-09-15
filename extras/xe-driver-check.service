@@ -1,0 +1,15 @@
+# Copy to ~/.config/systemd/user/, set ExecStart to where xe-driver-check.sh lives, then:
+#   systemctl --user daemon-reload && systemctl --user enable xe-driver-check.service
+[Unit]
+Description=Warn if the running kernel lacks the patched xe module
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+# give the shell a moment to be ready to show notifications
+ExecStartPre=/bin/sleep 8
+ExecStart=%h/xe-adlp-perf/extras/xe-driver-check.sh
+
+[Install]
+WantedBy=graphical-session.target

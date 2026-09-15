@@ -1,0 +1,36 @@
+From 243c795745c85e68e7ad520609a07987dbb2fd77 Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Mon, 1 Jun 2026 13:34:57 +0300
+Subject: [PATCH 03/22] drm/i915/xe: Enable HPD polling later during system
+ resume
+
+The detect hook of connectors - called by HPD polling - will check if
+user accesses are enabled and prevent the connector detection if that's
+not the case. Accordingly enable user accesses during system resume by
+calling intel_display_driver_enable_user_access() before enabling HPD
+polling.
+
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Link: https://patch.msgid.link/f9803b937ba3044052a81e1673ac374809548ba7.1780310011.git.jani.nikula@intel.com
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+---
+ drivers/gpu/drm/xe/display/xe_display.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/xe/display/xe_display.c b/drivers/gpu/drm/xe/display/xe_display.c
+index 810d93f..c0d3e7d 100644
+--- a/drivers/gpu/drm/xe/display/xe_display.c
++++ b/drivers/gpu/drm/xe/display/xe_display.c
+@@ -452,8 +452,8 @@ void xe_display_pm_resume(struct xe_device *xe)
+ 
+ 	if (intel_display_device_present(display)) {
+ 		intel_display_driver_resume(display);
+-		drm_kms_helper_poll_enable(&xe->drm);
+ 		intel_display_driver_enable_user_access(display);
++		drm_kms_helper_poll_enable(&xe->drm);
+ 	}
+ 
+ 	if (intel_display_device_present(display))
+-- 
+2.55.0
+
