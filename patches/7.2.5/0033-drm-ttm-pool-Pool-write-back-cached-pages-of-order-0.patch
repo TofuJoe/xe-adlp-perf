@@ -1,0 +1,127 @@
+From ce95557820cf3f6e00fdf071fe7a97780411cc50 Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Tue, 15 Sep 2026 15:37:46 -0700
+Subject: [PATCH 33/34] drm/ttm/pool: Pool write-back cached pages of order > 0
+
+TTM keeps freed pages in per-caching, per-order pools only for write-combined
+and uncached pages, because pooling was introduced to avoid the cost of
+changing caching attributes; write-back cached pages go straight back to the
+page allocator. On an integrated GPU whose clients allocate and free 2 MiB
+buffers all the time (browsers here do ~28 per second) every buffer then
+costs a 2 MiB page-allocator attempt plus fallbacks with direct reclaim under
+fragmentation (~190 us, 29 alloc_pages() calls measured) and ~55 us of frees,
+and the frees fragment memory for the next attempt.
+
+Add global pool types for cached pages of order > 0 (and a DMA32 twin), so a
+freed 2 MiB chunk is cleared and kept for the next allocation instead. Order
+0 stays with the page allocator. Pooled pages are cleared on the way in,
+accounted as NR_GPU_RECLAIM, bounded by page_pool_size and returned by the
+existing pool shrinker under memory pressure, exactly like the WC/UC pools.
+For cached TTs the pool stays usable after a fallback to the system
+allocator, since no caching change has to be applied to fresh pages.
+
+Runtime switch: ttm.pool_cached=0 (pages already pooled drain via the
+shrinker). Debugfs page_pool gains "wb" rows.
+
+Assisted-by: Claude Fable 5.1
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/ttm/ttm_pool.c | 39 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/ttm/ttm_pool.c b/drivers/gpu/drm/ttm/ttm_pool.c
+index 6142f90..6249153 100644
+--- a/drivers/gpu/drm/ttm/ttm_pool.c
++++ b/drivers/gpu/drm/ttm/ttm_pool.c
+@@ -134,14 +134,30 @@ static unsigned long page_pool_size;
+ MODULE_PARM_DESC(page_pool_size, "Number of pages in the WC/UC/DMA pool per NUMA node");
+ module_param(page_pool_size, ulong, 0644);
+ 
++/*
++ * Pool write-back cached pages of order > 0 as well. Upstream returns them to
++ * the page allocator immediately, because pooling only pays for pages whose
++ * caching attributes had to be changed. On an integrated GPU whose clients
++ * create and free 2 MiB buffers all the time that costs ~30 page-allocator
++ * calls per buffer (a 2 MiB attempt, then fallbacks with reclaim under
++ * fragmentation) and the frees fragment memory for the next attempt. Pooled
++ * pages are cleared on the way in, count as reclaimable and are returned by
++ * the pool shrinker under memory pressure like the WC/UC pools.
++ */
++static bool pool_cached = true;
++MODULE_PARM_DESC(pool_cached, "Also pool write-back cached pages of order > 0 (default: true)");
++module_param(pool_cached, bool, 0644);
++
+ static unsigned long pool_node_limit[MAX_NUMNODES];
+ static atomic_long_t allocated_pages[MAX_NUMNODES];
+ 
+ static struct ttm_pool_type global_write_combined[NR_PAGE_ORDERS];
+ static struct ttm_pool_type global_uncached[NR_PAGE_ORDERS];
++static struct ttm_pool_type global_cached[NR_PAGE_ORDERS];
+ 
+ static struct ttm_pool_type global_dma32_write_combined[NR_PAGE_ORDERS];
+ static struct ttm_pool_type global_dma32_uncached[NR_PAGE_ORDERS];
++static struct ttm_pool_type global_dma32_cached[NR_PAGE_ORDERS];
+ 
+ static spinlock_t shrinker_lock;
+ static struct list_head shrinker_list;
+@@ -438,6 +454,13 @@ static struct ttm_pool_type *ttm_pool_select_type(struct ttm_pool *pool,
+ 			return &global_dma32_uncached[order];
+ 
+ 		return &global_uncached[order];
++	case ttm_cached:
++		if (!order || !READ_ONCE(pool_cached))
++			break;
++		if (ttm_pool_uses_dma32(pool))
++			return &global_dma32_cached[order];
++
++		return &global_cached[order];
+ 	default:
+ 		break;
+ 	}
+@@ -823,7 +846,11 @@ static int __ttm_pool_alloc(struct ttm_pool *pool, struct ttm_tt *tt,
+ 		 */
+ 		if (!p) {
+ 			page_caching = ttm_cached;
+-			allow_pools = false;
++			/*
++			 * Mixing pooled and fresh pages only matters when a
++			 * caching change must be applied to the fresh ones.
++			 */
++			allow_pools = tt->caching == ttm_cached;
+ 			p = ttm_pool_alloc_page(pool, gfp_flags, order);
+ 		}
+ 		/* If that fails, lower the order if possible and retry. */
+@@ -1376,6 +1403,10 @@ static int ttm_pool_debugfs_globals_show(struct seq_file *m, void *data)
+ 	ttm_pool_debugfs_orders(global_dma32_write_combined, m);
+ 	seq_puts(m, "uc 32\t:");
+ 	ttm_pool_debugfs_orders(global_dma32_uncached, m);
++	seq_puts(m, "wb\t:");
++	ttm_pool_debugfs_orders(global_cached, m);
++	seq_puts(m, "wb 32\t:");
++	ttm_pool_debugfs_orders(global_dma32_cached, m);
+ 	spin_unlock(&shrinker_lock);
+ 
+ 	ttm_pool_debugfs_footer(m);
+@@ -1503,6 +1534,9 @@ int ttm_pool_mgr_init(unsigned long num_pages)
+ 				   ttm_write_combined, i);
+ 		ttm_pool_type_init(&global_dma32_uncached[i], NULL,
+ 				   ttm_uncached, i);
++
++		ttm_pool_type_init(&global_cached[i], NULL, ttm_cached, i);
++		ttm_pool_type_init(&global_dma32_cached[i], NULL, ttm_cached, i);
+ 	}
+ 
+ #ifdef CONFIG_DEBUG_FS
+@@ -1545,6 +1579,9 @@ void ttm_pool_mgr_fini(void)
+ 
+ 		ttm_pool_type_fini(&global_dma32_write_combined[i]);
+ 		ttm_pool_type_fini(&global_dma32_uncached[i]);
++
++		ttm_pool_type_fini(&global_cached[i]);
++		ttm_pool_type_fini(&global_dma32_cached[i]);
+ 	}
+ 
+ 	shrinker_free(mm_shrinker);
+-- 
+2.55.0
+

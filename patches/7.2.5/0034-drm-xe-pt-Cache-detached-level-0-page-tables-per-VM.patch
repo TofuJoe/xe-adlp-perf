@@ -1,0 +1,453 @@
+From ffa16c5fae23ff8212352dbef6bac28f90e25d89 Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Tue, 15 Sep 2026 15:37:46 -0700
+Subject: [PATCH 34/34] drm/xe/pt: Cache detached level-0 page tables per VM
+
+Every bind of a fresh 2 MiB range creates a level-0 page table (kzalloc,
+a pinned and mapped BO with its TTM state and a page, client accounting)
+and every unbind destroys one through ttm_bo_release(), which individualizes
+the VM's dma-resv (allocating and copying every fence of the VM) and, while
+the VM has running jobs, defers the free to a worker that waits for them.
+Browser workloads do this tens of times per second: 60-100 us of CPU per
+2 MiB buffer plus a worker wake-up.
+
+Keep tables that an unbind detached on a per-VM, per-tile list (at most 64,
+still pinned and mapped) tagged with the fences of that unbind's TLB
+invalidation. xe_pt_create() reuses the oldest entry whose fences have
+signaled: by then the PDE no longer points at the page and no walker can
+hold a translation through it. Tables that were never visible to the GPU
+(bind aborted before commit) are reusable immediately. Tables replaced by a
+bind, which has no invalidation of its own, keep the original destroy path,
+as do page-directories and everything at VM teardown, where the cache is
+drained before the root is destroyed. A reused table is reset to the state
+of a fresh kzalloc; its contents are fully rewritten by the bind, as before
+(populate_empty or a full 2 MiB of entries).
+
+Assisted-by: Claude Fable 5.1
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/xe/xe_pt.c       | 216 +++++++++++++++++++++++++++++--
+ drivers/gpu/drm/xe/xe_pt.h       |   3 +
+ drivers/gpu/drm/xe/xe_pt_types.h |  15 +++
+ drivers/gpu/drm/xe/xe_vm.c       |   2 +
+ drivers/gpu/drm/xe/xe_vm_types.h |  13 ++
+ 5 files changed, 239 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_pt.c b/drivers/gpu/drm/xe/xe_pt.c
+index d0a1e6c..e3bbd0a 100644
+--- a/drivers/gpu/drm/xe/xe_pt.c
++++ b/drivers/gpu/drm/xe/xe_pt.c
+@@ -85,6 +85,139 @@ static void xe_pt_free(struct xe_pt *pt)
+ 		kfree(pt);
+ }
+ 
++/*
++ * Cache of detached level-0 page tables, per VM and tile.
++ *
++ * Every bind of a fresh 2 MiB range needs a level-0 table and every unbind
++ * drops one again. Creating one means a kzalloc, a pinned and mapped BO with
++ * its TTM state and a page; destroying one goes through ttm_bo_release(),
++ * which individualizes the VM's dma-resv (allocating and copying every fence
++ * of the VM) and, while the VM has running jobs, defers the free to a worker
++ * that waits for them. Browsers do this tens of times per second.
++ *
++ * Instead, tables that an unbind detached are kept pinned and mapped on a
++ * short per-VM list together with the fences of that unbind's TLB
++ * invalidation. The next xe_pt_create() reuses the oldest entry whose fences
++ * have signaled, at which point no page walker can still reference the page.
++ * Tables that were never visible to the GPU (bind aborted before commit) are
++ * reusable at once. Tables replaced by a bind (no invalidation of their own)
++ * keep the original destroy path.
++ */
++#define XE_PT_CACHE_MAX 64
++
++static bool xe_pt_cache_reusable(const struct xe_pt *pt)
++{
++	return (!pt->cache_fence || dma_fence_is_signaled(pt->cache_fence)) &&
++	       (!pt->cache_mfence || dma_fence_is_signaled(pt->cache_mfence));
++}
++
++static struct xe_pt *xe_pt_cache_get(struct xe_vm *vm, struct xe_tile *tile)
++{
++	struct xe_pt *pt, *found = NULL;
++	struct xe_bo *bo;
++	u8 id = tile->id;
++	int n = 0;
++
++	spin_lock(&vm->pt_cache[id].lock);
++	list_for_each_entry(pt, &vm->pt_cache[id].list, cache_link) {
++		if (xe_pt_cache_reusable(pt)) {
++			list_del(&pt->cache_link);
++			vm->pt_cache[id].count--;
++			found = pt;
++			break;
++		}
++		/* Oldest first: if the head is still busy, so are the others. */
++		if (++n >= 4)
++			break;
++	}
++	spin_unlock(&vm->pt_cache[id].lock);
++
++	if (!found)
++		return NULL;
++
++	dma_fence_put(found->cache_fence);
++	dma_fence_put(found->cache_mfence);
++
++	/* Same state as a fresh kzalloc: level 0, no children, num_live 0. */
++	bo = found->bo;
++	memset(found, 0, sizeof(*found));
++	found->bo = bo;
++
++	return found;
++}
++
++/*
++ * Hand a detached level-0 table to the VM's cache. @fence / @mfence (may be
++ * NULL) must have signaled before the table is reused. Returns false if the
++ * cache is full or the VM is closing; the caller then destroys the table.
++ */
++static bool xe_pt_cache_put(struct xe_vm *vm, struct xe_pt *pt,
++			    struct dma_fence *fence, struct dma_fence *mfence)
++{
++	u8 id = pt->bo->tile->id;
++	bool cached = false;
++
++	if (xe_vm_is_closed(vm))
++		return false;
++
++	spin_lock(&vm->pt_cache[id].lock);
++	if (vm->pt_cache[id].count < XE_PT_CACHE_MAX) {
++		pt->cache_fence = dma_fence_get(fence);
++		pt->cache_mfence = dma_fence_get(mfence);
++		list_add_tail(&pt->cache_link, &vm->pt_cache[id].list);
++		vm->pt_cache[id].count++;
++		cached = true;
++	}
++	spin_unlock(&vm->pt_cache[id].lock);
++
++	return cached;
++}
++
++/**
++ * xe_pt_cache_init() - Initialize a VM's page-table cache
++ * @vm: The VM
++ */
++void xe_pt_cache_init(struct xe_vm *vm)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(vm->pt_cache); i++) {
++		spin_lock_init(&vm->pt_cache[i].lock);
++		INIT_LIST_HEAD(&vm->pt_cache[i].list);
++		vm->pt_cache[i].count = 0;
++	}
++}
++
++/**
++ * xe_pt_cache_drain() - Destroy every cached page table of a VM
++ * @vm: The VM, with its dma-resv held and no binds in flight (VM close)
++ */
++void xe_pt_cache_drain(struct xe_vm *vm)
++{
++	struct xe_pt *pt, *next;
++	int i;
++
++	xe_vm_assert_held(vm);
++
++	for (i = 0; i < ARRAY_SIZE(vm->pt_cache); i++) {
++		LIST_HEAD(list);
++
++		spin_lock(&vm->pt_cache[i].lock);
++		list_splice_init(&vm->pt_cache[i].list, &list);
++		vm->pt_cache[i].count = 0;
++		spin_unlock(&vm->pt_cache[i].lock);
++
++		list_for_each_entry_safe(pt, next, &list, cache_link) {
++			list_del(&pt->cache_link);
++			dma_fence_put(pt->cache_fence);
++			dma_fence_put(pt->cache_mfence);
++			xe_bo_unpin(pt->bo);
++			xe_bo_put(pt->bo);
++			xe_pt_free(pt);
++		}
++	}
++}
++
+ /**
+  * xe_pt_create() - Create a page-table.
+  * @vm: The vm to create for.
+@@ -109,6 +242,12 @@ struct xe_pt *xe_pt_create(struct xe_vm *vm, struct xe_tile *tile,
+ 	u32 bo_flags;
+ 	int err;
+ 
++	if (!level) {
++		pt = xe_pt_cache_get(vm, tile);
++		if (pt)
++			return pt;
++	}
++
+ 	if (level) {
+ 		struct xe_pt_dir *dir = kzalloc_obj(*dir);
+ 
+@@ -204,13 +343,30 @@ unsigned int xe_pt_shift(unsigned int level)
+  * Puts the page-table bo, recursively calls xe_pt_destroy on all children
+  * and finally frees @pt. TODO: Can we remove the @flags argument?
+  */
+-void xe_pt_destroy(struct xe_pt *pt, u32 flags, struct llist_head *deferred)
++/*
++ * @cache_vm: VM whose page-table cache may take level-0 tables, or NULL.
++ * @pending: with @cache_vm, list to collect tables that were visible to the
++ *           GPU; they join the cache once the operation's fences are known
++ *           (xe_pt_cache_commit()). NULL: the table was never visible and is
++ *           cached right away.
++ */
++static void __xe_pt_destroy(struct xe_pt *pt, struct llist_head *deferred,
++			    struct xe_vm *cache_vm, struct list_head *pending)
+ {
+ 	int i;
+ 
+ 	if (!pt)
+ 		return;
+ 
++	if (!pt->level && cache_vm) {
++		if (pending) {
++			list_add_tail(&pt->cache_link, pending);
++			return;
++		}
++		if (xe_pt_cache_put(cache_vm, pt, NULL, NULL))
++			return;
++	}
++
+ 	XE_WARN_ON(!list_empty(&pt->bo->ttm.base.gpuva.list));
+ 	xe_bo_unpin(pt->bo);
+ 	xe_bo_put_deferred(pt->bo, deferred);
+@@ -220,13 +376,41 @@ void xe_pt_destroy(struct xe_pt *pt, u32 flags, struct llist_head *deferred)
+ 
+ 		for (i = 0; i < XE_PDES; i++) {
+ 			if (xe_pt_entry_staging(pt_dir, i))
+-				xe_pt_destroy(xe_pt_entry_staging(pt_dir, i), flags,
+-					      deferred);
++				__xe_pt_destroy(xe_pt_entry_staging(pt_dir, i),
++						deferred, cache_vm, pending);
+ 		}
+ 	}
+ 	xe_pt_free(pt);
+ }
+ 
++void xe_pt_destroy(struct xe_pt *pt, u32 flags, struct llist_head *deferred)
++{
++	__xe_pt_destroy(pt, deferred, NULL, NULL);
++}
++
++/*
++ * Move the tables an operation detached into the VM's cache, tagged with the
++ * fences of its TLB invalidation. Without an invalidation fence (or when the
++ * cache is full) they are destroyed as before.
++ */
++static void xe_pt_cache_commit(struct xe_vm *vm, struct list_head *pending,
++			       struct llist_head *deferred,
++			       struct dma_fence *fence, struct dma_fence *mfence)
++{
++	struct xe_pt *pt, *next;
++
++	list_for_each_entry_safe(pt, next, pending, cache_link) {
++		list_del(&pt->cache_link);
++		if (fence && xe_pt_cache_put(vm, pt, fence, mfence))
++			continue;
++
++		XE_WARN_ON(!list_empty(&pt->bo->ttm.base.gpuva.list));
++		xe_bo_unpin(pt->bo);
++		xe_bo_put_deferred(pt->bo, deferred);
++		xe_pt_free(pt);
++	}
++}
++
+ /**
+  * xe_pt_clear() - Clear a page-table.
+  * @xe: xe device.
+@@ -1062,8 +1246,8 @@ static void xe_pt_cancel_bind(struct xe_vma *vma,
+ 
+ 		if (pt->level) {
+ 			for (j = 0; j < entries[i].qwords; j++)
+-				xe_pt_destroy(entries[i].pt_entries[j].pt,
+-					      xe_vma_vm(vma)->flags, NULL);
++				__xe_pt_destroy(entries[i].pt_entries[j].pt,
++						NULL, xe_vma_vm(vma), NULL);
+ 		}
+ 
+ 		kfree(entries[i].pt_entries);
+@@ -1106,8 +1290,11 @@ static void xe_pt_commit_locks_assert(struct xe_vma *vma)
+ 
+ static void xe_pt_commit(struct xe_vma *vma,
+ 			 struct xe_vm_pgtable_update *entries,
+-			 u32 num_entries, struct llist_head *deferred)
++			 u32 num_entries, struct llist_head *deferred,
++			 struct list_head *cache_pending)
+ {
++	struct xe_vm *cache_vm = (vma == XE_INVALID_VMA || !cache_pending) ?
++		NULL : xe_vma_vm(vma);
+ 	u32 i, j;
+ 
+ 	xe_pt_commit_locks_assert(vma);
+@@ -1125,8 +1312,8 @@ static void xe_pt_commit(struct xe_vma *vma,
+ 			int j_ = j + entries[i].ofs;
+ 
+ 			pt_dir->children[j_] = pt_dir->staging[j_];
+-			xe_pt_destroy(oldpte, (vma == XE_INVALID_VMA) ? 0 :
+-				      xe_vma_vm(vma)->flags, deferred);
++			__xe_pt_destroy(oldpte, deferred, cache_vm,
++					cache_vm ? cache_pending : NULL);
+ 		}
+ 	}
+ }
+@@ -1156,7 +1343,7 @@ static void xe_pt_abort_bind(struct xe_vma *vma,
+ 			struct xe_pt *oldpte = entries[i].pt_entries[j].pt;
+ 
+ 			pt_dir->staging[j_] = oldpte ? &oldpte->base : 0;
+-			xe_pt_destroy(newpte, xe_vma_vm(vma)->flags, NULL);
++			__xe_pt_destroy(newpte, NULL, xe_vma_vm(vma), NULL);
+ 		}
+ 	}
+ }
+@@ -2368,6 +2555,7 @@ static void
+ xe_pt_update_ops_init(struct xe_vm_pgtable_update_ops *pt_update_ops)
+ {
+ 	init_llist_head(&pt_update_ops->deferred);
++	INIT_LIST_HEAD(&pt_update_ops->pt_cache_pending);
+ 	pt_update_ops->current_op = 0;
+ 	pt_update_ops->start = ~0x0ull;
+ 	pt_update_ops->last = 0x0ull;
+@@ -2716,8 +2904,10 @@ xe_pt_update_ops_run(struct xe_tile *tile, struct xe_vma_ops *vops)
+ 	for (i = 0; i < pt_update_ops->current_op; ++i) {
+ 		struct xe_vm_pgtable_update_op *pt_op = &pt_update_ops->ops[i];
+ 
++		/* Only tables detached by an unbind get a TLB invalidation of their own. */
+ 		xe_pt_commit(pt_op->vma, pt_op->entries,
+-			     pt_op->num_entries, &pt_update_ops->deferred);
++			     pt_op->num_entries, &pt_update_ops->deferred,
++			     pt_op->bind ? NULL : &pt_update_ops->pt_cache_pending);
+ 		pt_op->vma = NULL;	/* skip in xe_pt_update_ops_abort */
+ 	}
+ 
+@@ -2774,6 +2964,9 @@ xe_pt_update_ops_run(struct xe_tile *tile, struct xe_vma_ops *vops)
+ 	if (!(q->flags & EXEC_QUEUE_FLAG_MIGRATE))
+ 		xe_exec_queue_last_fence_set(q, vm, fence);
+ 
++	xe_pt_cache_commit(vm, &pt_update_ops->pt_cache_pending,
++			   &pt_update_ops->deferred, ifence, mfence);
++
+ 	xe_tlb_inval_job_put(mjob);
+ 	xe_tlb_inval_job_put(ijob);
+ 	dma_fence_put(ifence);
+@@ -2817,6 +3010,9 @@ void xe_pt_update_ops_fini(struct xe_tile *tile, struct xe_vma_ops *vops)
+ 
+ 		xe_pt_free_bind(pt_op->entries, pt_op->num_entries);
+ 	}
++	/* Nothing should be left here; if it is, destroy it rather than cache it. */
++	xe_pt_cache_commit(vops->vm, &pt_update_ops->pt_cache_pending,
++			   &pt_update_ops->deferred, NULL, NULL);
+ 	xe_bo_put_commit(&vops->pt_update_ops[tile->id].deferred);
+ }
+ 
+diff --git a/drivers/gpu/drm/xe/xe_pt.h b/drivers/gpu/drm/xe/xe_pt.h
+index 4daeeba..d2bab03 100644
+--- a/drivers/gpu/drm/xe/xe_pt.h
++++ b/drivers/gpu/drm/xe/xe_pt.h
+@@ -37,6 +37,9 @@ void xe_pt_populate_empty(struct xe_tile *tile, struct xe_vm *vm,
+ 
+ void xe_pt_destroy(struct xe_pt *pt, u32 flags, struct llist_head *deferred);
+ 
++void xe_pt_cache_init(struct xe_vm *vm);
++void xe_pt_cache_drain(struct xe_vm *vm);
++
+ void xe_pt_clear(struct xe_device *xe, struct xe_pt *pt);
+ 
+ int xe_pt_update_ops_prepare(struct xe_tile *tile, struct xe_vma_ops *vops);
+diff --git a/drivers/gpu/drm/xe/xe_pt_types.h b/drivers/gpu/drm/xe/xe_pt_types.h
+index a7d1bb7..af7f00b 100644
+--- a/drivers/gpu/drm/xe/xe_pt_types.h
++++ b/drivers/gpu/drm/xe/xe_pt_types.h
+@@ -6,6 +6,7 @@
+ #ifndef _XE_PT_TYPES_H_
+ #define _XE_PT_TYPES_H_
+ 
++#include <linux/dma-fence.h>
+ #include <linux/types.h>
+ 
+ #include "xe_page_reclaim.h"
+@@ -33,6 +34,15 @@ struct xe_pt {
+ 	unsigned int num_live;
+ 	bool rebind;
+ 	bool is_compact;
++	/** @cache_link: link in the VM's cache of detached level-0 tables */
++	struct list_head cache_link;
++	/**
++	 * @cache_fence: fence after which a cached table may be reused (the
++	 * TLB invalidation of the unbind that detached it), or NULL.
++	 */
++	struct dma_fence *cache_fence;
++	/** @cache_mfence: same for the media GT's invalidation, or NULL */
++	struct dma_fence *cache_mfence;
+ #if IS_ENABLED(CONFIG_DRM_XE_DEBUG_VM)
+ 	/** @addr: Virtual address start address of the PT. */
+ 	u64 addr;
+@@ -97,6 +107,11 @@ struct xe_vm_pgtable_update_ops {
+ 	struct xe_vm_pgtable_update_op *ops;
+ 	/** @deferred: deferred list to destroy PT entries */
+ 	struct llist_head deferred;
++	/**
++	 * @pt_cache_pending: level-0 page tables detached by this operation
++	 * that go to the VM's page-table cache once its fences are known.
++	 */
++	struct list_head pt_cache_pending;
+ 	/** @q: exec queue for PT operations */
+ 	struct xe_exec_queue *q;
+ 	/** @prl: embedded page reclaim list */
+diff --git a/drivers/gpu/drm/xe/xe_vm.c b/drivers/gpu/drm/xe/xe_vm.c
+index 67819de..166e517 100644
+--- a/drivers/gpu/drm/xe/xe_vm.c
++++ b/drivers/gpu/drm/xe/xe_vm.c
+@@ -1654,6 +1654,7 @@ struct xe_vm *xe_vm_create(struct xe_device *xe, u32 flags, struct xe_file *xef)
+ 
+ 	INIT_LIST_HEAD(&vm->faults.list);
+ 	spin_lock_init(&vm->faults.lock);
++	xe_pt_cache_init(vm);
+ 
+ 	ttm_lru_bulk_move_init(&vm->lru_bulk_move);
+ 
+@@ -1940,6 +1941,7 @@ void xe_vm_close_and_put(struct xe_vm *vm)
+ 	 * install a fence to resv. Hence it's safe to
+ 	 * destroy the pagetables immediately.
+ 	 */
++	xe_pt_cache_drain(vm);
+ 	xe_vm_free_scratch(vm);
+ 	xe_vm_pt_destroy(vm);
+ 	xe_vm_unlock(vm);
+diff --git a/drivers/gpu/drm/xe/xe_vm_types.h b/drivers/gpu/drm/xe/xe_vm_types.h
+index fa603d9..a36c884 100644
+--- a/drivers/gpu/drm/xe/xe_vm_types.h
++++ b/drivers/gpu/drm/xe/xe_vm_types.h
+@@ -222,6 +222,19 @@ struct xe_vm {
+ 	 */
+ 	unsigned int exec_nr_objs;
+ 
++	/**
++	 * @pt_cache: per-tile cache of detached level-0 page tables, kept
++	 * pinned and mapped for reuse by the next bind (see xe_pt_create()).
++	 */
++	struct {
++		/** @pt_cache.lock: protects @pt_cache.list and @pt_cache.count */
++		spinlock_t lock;
++		/** @pt_cache.list: cached tables, oldest first */
++		struct list_head list;
++		/** @pt_cache.count: number of cached tables */
++		unsigned int count;
++	} pt_cache[XE_MAX_TILES_PER_DEVICE];
++
+ 	/** @svm: Shared virtual memory state */
+ 	struct {
+ 		/** @svm.gpusvm: base GPUSVM used to track fault allocations */
+-- 
+2.55.0
+

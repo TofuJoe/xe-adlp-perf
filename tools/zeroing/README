@@ -1,0 +1,16 @@
+Zeroing microbenchmarks used to size the contiguous-clear change in ttm_pool.c (patch 0035).
+See the "Page clearing" section of the repository README.
+
+  gcc -O2 -mavx2 -mmovdir64b -o zero zero.c && taskset -c 0 ./zero
+      bandwidth per method: memset / AVX2 NT / movdir64b, whole-range vs 4 KiB chunks
+
+  gcc -O2 -o zerowork zerowork.c && ./zero-energy.sh
+      RAPL package energy per GiB cleared, bulk vs 4 KiB chunks (needs passwordless sudo
+      to read intel-rapl energy_uj). zerowork.c needs the asm memory clobber - without it
+      gcc elides the whole-range memset as a dead store and the numbers are nonsense.
+
+  gcc -O2 -o bo-churn bo-churn.c && ./bo-churn 200 8
+      deterministic BO churn through the xe uapi (create + close N BOs of a known size),
+      so clearing cost can be read per MiB. Build against the system drm headers
+      (/usr/include/drm); the ktree uapi headers do not compile from user space.
+      A/B the clearing method with /sys/module/ttm/parameters/pool_clear_contig.

@@ -6,7 +6,7 @@ set -euo pipefail
 K=${1:-$(uname -r)}
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
 [ -d "/lib/modules/$K" ] || { echo "no /lib/modules/$K"; exit 1; }
-rm -f "/lib/modules/$K/updates/xe.ko"
+rm -f "/lib/modules/$K/updates/xe.ko" "/lib/modules/$K/updates/ttm.ko"
 depmod -a "$K"
 if [ -f "/boot/initramfs-$K.img.bak-pre-xe-patched" ]; then
 	mv "/boot/initramfs-$K.img.bak-pre-xe-patched" "/boot/initramfs-$K.img"
@@ -14,4 +14,5 @@ else
 	dracut -f "/boot/initramfs-$K.img" "$K"
 fi
 echo "modprobe now resolves xe to: $(modinfo -k "$K" -n xe)"
+echo "modprobe now resolves ttm to: $(modinfo -k "$K" -n ttm)"
 echo "Reverted $K. Reboot if it is the running kernel."

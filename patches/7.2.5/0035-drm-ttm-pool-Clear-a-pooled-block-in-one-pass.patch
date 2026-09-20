@@ -1,0 +1,70 @@
+From e74590f23fc1c88785c89c651292038ec22a4664 Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Sat, 19 Sep 2026 21:12:11 -0600
+Subject: [PATCH] drm/ttm/pool: Clear a pooled block in one pass
+
+ttm_pool_type_give() cleared an order-N block one 4 KiB page at a time. The
+pages of such a block are physically contiguous and, without highmem, so is
+their direct map, so the whole block can be cleared in a single memset. Per
+page clears restart the string operation every 4 KiB and never let the
+prefetchers get going.
+
+Measured on Alder Lake-P / LPDDR5-5200 with a deterministic BO churn
+(create + close 400 buffers of a known size, pinned to a P core):
+
+  2 MiB BOs: 99.1 -> 70.7 us/MiB  (-29%), package energy 2.5 -> 2.0 J
+  8 MiB BOs: 86.9 -> 68.5 us/MiB  (-21%), package energy 6.9 -> 5.7 J
+
+ttm.pool_clear_contig=N restores the per-page path at runtime for A/B.
+---
+ drivers/gpu/drm/ttm/ttm_pool.c | 27 +++++++++++++++++++++------
+ 1 file changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/ttm/ttm_pool.c b/drivers/gpu/drm/ttm/ttm_pool.c
+index 6249153..2d8a0b5 100644
+--- a/drivers/gpu/drm/ttm/ttm_pool.c
++++ b/drivers/gpu/drm/ttm/ttm_pool.c
+@@ -148,6 +148,11 @@ static bool pool_cached = true;
+ MODULE_PARM_DESC(pool_cached, "Also pool write-back cached pages of order > 0 (default: true)");
+ module_param(pool_cached, bool, 0644);
+ 
++static bool pool_clear_contig = true;
++MODULE_PARM_DESC(pool_clear_contig,
++		 "Clear a pooled block in one pass instead of page by page (default: true)");
++module_param(pool_clear_contig, bool, 0644);
++
+ static unsigned long pool_node_limit[MAX_NUMNODES];
+ static atomic_long_t allocated_pages[MAX_NUMNODES];
+ 
+@@ -339,12 +344,22 @@ static void ttm_pool_type_give(struct ttm_pool_type *pt, struct page *p)
+ 	unsigned int i, num_pages = 1 << pt->order;
+ 	int nid = page_to_nid(p);
+ 
+-	for (i = 0; i < num_pages; ++i) {
+-		if (PageHighMem(p))
+-			clear_highpage(p + i);
+-		else
+-			clear_page(page_address(p + i));
+-	}
++	/*
++	 * An order > 0 block is physically contiguous and, without highmem, so
++	 * is its direct map, so clear it in one pass. Clearing page by page
++	 * restarts the string operation every 4 KiB and never lets the
++	 * prefetchers get going: measured on ADL-P/LPDDR5, 14 GB/s in 4 KiB
++	 * chunks against 48 GB/s over the whole range.
++	 */
++	if (!PageHighMem(p) && READ_ONCE(pool_clear_contig))
++		memset(page_address(p), 0, (size_t)num_pages << PAGE_SHIFT);
++	else
++		for (i = 0; i < num_pages; ++i) {
++			if (PageHighMem(p))
++				clear_highpage(p + i);
++			else
++				clear_page(page_address(p + i));
++		}
+ 
+ 	INIT_LIST_HEAD(&p->lru);
+ 	rcu_read_lock();
+-- 
+2.55.0
+

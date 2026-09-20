@@ -6,7 +6,8 @@
 # Needs kernel-devel-<kernel-version> (/usr/src/kernels/<kernel-version>), gcc, make, git, curl,
 # xz. Downloads linux-<upstream-version>.tar.xz from cdn.kernel.org once (to dl/) and checks
 # it against kernel.org's sha256sums.asc (checksum only; the file's PGP signature is not checked).
-# Output: build/<kernel-version>/xe.ko
+# Output: build/<kernel-version>/xe.ko and build/<kernel-version>/ttm.ko (the TTM core module,
+# which patches 0033 and 0035 change; install.sh installs it alongside xe.ko).
 set -euo pipefail
 R=$(cd "$(dirname "$0")" && pwd)
 K=${1:-$(uname -r)}
@@ -38,9 +39,11 @@ rm -rf "$W"
 mkdir -p "$W"
 cp -a "$DEVEL" "$W/ktree"
 chmod -R u+w "$W/ktree"
-rm -rf "$W/ktree/drivers/gpu/drm/xe" "$W/ktree/drivers/gpu/drm/i915"
-tar -C "$W" -xf "$T" "linux-$UP/drivers/gpu/drm/xe" "linux-$UP/drivers/gpu/drm/i915"
-mv "$W/linux-$UP/drivers/gpu/drm/xe" "$W/linux-$UP/drivers/gpu/drm/i915" "$W/ktree/drivers/gpu/drm/"
+rm -rf "$W/ktree/drivers/gpu/drm/xe" "$W/ktree/drivers/gpu/drm/i915" "$W/ktree/drivers/gpu/drm/ttm"
+tar -C "$W" -xf "$T" "linux-$UP/drivers/gpu/drm/xe" "linux-$UP/drivers/gpu/drm/i915" \
+	"linux-$UP/drivers/gpu/drm/ttm"
+mv "$W/linux-$UP/drivers/gpu/drm/xe" "$W/linux-$UP/drivers/gpu/drm/i915" \
+	"$W/linux-$UP/drivers/gpu/drm/ttm" "$W/ktree/drivers/gpu/drm/"
 rm -rf "$W/linux-$UP"
 # An empty git repo in the tree, so git apply works relative to it and not to this checkout.
 git init -q "$W/ktree"
@@ -48,15 +51,19 @@ for p in "$P"/*.patch; do
 	git -C "$W/ktree" apply "$p" || { echo "patch failed: $(basename "$p")"; exit 1; }
 done
 
+make -C "$W/ktree" -j"$(nproc)" M=drivers/gpu/drm/ttm modules
 make -C "$W/ktree" -j"$(nproc)" M=drivers/gpu/drm/xe modules
 cp "$W/ktree/drivers/gpu/drm/xe/xe.ko" "$W/xe.ko"
-strip --strip-debug "$W/xe.ko"
+cp "$W/ktree/drivers/gpu/drm/ttm/ttm.ko" "$W/ttm.ko"
+strip --strip-debug "$W/xe.ko" "$W/ttm.ko"
 
 if [ -n "${MOK_KEY:-}" ]; then
 	"$DEVEL/scripts/sign-file" sha256 "$MOK_KEY" "$MOK_CERT" "$W/xe.ko"
+	"$DEVEL/scripts/sign-file" sha256 "$MOK_KEY" "$MOK_CERT" "$W/ttm.ko"
 	echo "signed with $MOK_CERT"
 fi
 
 n=$(nm "$W/xe.ko" 2>/dev/null | grep -c ' T xe_bo_addr_iter') || true
 [ "$n" = 2 ] || { echo "unexpected: patched symbols missing from xe.ko"; exit 1; }
-echo "built $W/xe.ko (kernel $K). Install with: sudo ./install.sh $K"
+modinfo "$W/ttm.ko" | grep -q '^parm: *pool_cached' || { echo "unexpected: patched parameters missing from ttm.ko"; exit 1; }
+echo "built $W/xe.ko and $W/ttm.ko (kernel $K). Install with: sudo ./install.sh $K"
