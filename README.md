@@ -10,9 +10,10 @@
 # xe-adlp-perf
 
 Performance patches for the `xe` driver on **Alder Lake-P** integrated graphics, for Fedora 44
-kernel **7.2.5**. They started as a fix for one bad bug: on a 5K external monitor, every page flip
-took 20–70 ms in the kernel, so the mouse cursor lagged whenever anything animated on screen (a
-Google Maps tab was enough). With that fixed, the rest of the flip, render and memory-pressure
+kernels **7.3.3** (`patches/7.3.3/`, 30 patches) and **7.2.5** (`patches/7.2.5/`, 35 patches).
+They started as a fix for one bad bug: on a 5K external monitor, every page flip took 20–70 ms
+in the kernel, so the mouse cursor lagged whenever anything animated on screen (a Google Maps tab
+was enough). With that fixed, the rest of the flip, render and memory-pressure
 paths were profiled and trimmed.
 
 ## Impact
@@ -23,7 +24,8 @@ Lenovo P40w-20 at 5120x2160@60 over a USB4/Thunderbolt dock.
 
 Method: `strace -T` on gnome-shell's KMS thread for commit latency, and ftrace
 `function_profile` (the scripts in [tools/](tools/)) for kernel CPU time. Times in µs are CPU
-time per call.
+time per call. All measurements were taken on 7.2.5 and use the 7.2.5 patch numbers; see
+[Kernel 7.3.3](#kernel-733-patches733) for how they map to the 7.3.3 series.
 
 ### 5K page flips (Chrome with a Google Maps tab animating)
 
@@ -186,10 +188,40 @@ Intel's IGT suite. 0006, 0010, 0016, 0018–0022 and 0027 touch GPU frequency co
 invalidation, interrupt handling and memory reclaim, where a bug can mean hangs or corruption
 rather than a slow frame.
 
+## Kernel 7.3.3 (`patches/7.3.3/`)
+
+The 7.2.5 series rebased to 7.3.3, minus what 7.3 already contains, plus one new GuC patch. The
+code of the rebased patches is unchanged except where noted.
+
+| 7.3.3 | 7.2.5 | Note |
+|---|---|---|
+| 0001–0002 | 0001–0002 | |
+| — | 0003 | Dropped: upstream in 7.3 (display resume now enables polling after user access) |
+| 0003–0016 | 0004–0017 | |
+| 0017 | 0021 | |
+| 0018 | 0022, plus what remains of 0018 and 0020 | Upstream 7.3 rewrote the shrinker walk (keeps freed pages, stops on the first real error); only the skip of BOs that return -EBUSY/-EAGAIN before being scanned is left, folded in here |
+| 0019 | 0019 | |
+| 0020 | 0023 | |
+| — | 0024, 0025 | Dropped: upstream in 7.2.y stable |
+| — | 0026 | Dropped: upstream in 7.3-rc1 |
+| 0021–0029 | 0027–0035 | 0027 and 0029 are the TTM patches (`ttm.ko`) |
+| 0030 | new | GuC: skip the 1 µs teardown preemption for idle exec queues (`xe.skip_idle_teardown_preempt`) |
+
+0030: when an exec queue is destroyed, xe asks the GuC to preempt it within 1 µs. On ADL-P (GuC
+70.49.4) that makes the GuC reset the render engine even for short-lived queues that never ran any
+work (Nautilus, Wine and Xwayland startup), which shows up as "Engine reset" + "Timedout job"
+lines in the kernel log. The patch skips the 1 µs policy when every job of the queue has
+completed. It removes that log noise; it does not fix a separate, rarer video-engine failure
+("GuC engine reset request failed" followed by a full GT reset under heavy VA-API decoder churn),
+which also happens with a stock module.
+
+The 7.3.3 build was checked to produce the same `ttm.ko` code as the tested module and an `xe.ko`
+that differs from it only in four local diagnostic switches that are not published.
+
 ## Requirements
 
-- Fedora 44 with kernel `7.2.5-*.fc44.x86_64` and the matching `kernel-devel`. The series is for
-  7.2.5 source only; other kernels need it rebased.
+- Fedora 44 with kernel `7.3.3-*.fc44.x86_64` or `7.2.5-*.fc44.x86_64` and the matching
+  `kernel-devel`. `build.sh` picks `patches/<upstream version>/`; other versions need a rebase.
 - An Alder Lake-P iGPU running on `xe`. On ADL-P the kernel still defaults to `i915`, so boot with
   (replace `46a6` with your device ID from `lspci -nn | grep VGA`):
   ```
@@ -214,11 +246,11 @@ sudo mokutil --import ~/mok/MOK.der      # set a one-time password
 
 Build, sign and install for a kernel:
 ```
-MOK_KEY=~/mok/MOK.priv MOK_CERT=~/mok/MOK.der ./build.sh 7.2.5-200.fc44.x86_64
-sudo ./install.sh 7.2.5-200.fc44.x86_64
+MOK_KEY=~/mok/MOK.priv MOK_CERT=~/mok/MOK.der ./build.sh 7.3.3-200.fc44.x86_64
+sudo ./install.sh 7.3.3-200.fc44.x86_64
 reboot
 ```
-`build.sh` copies `kernel-devel` into `build/`, drops in the 7.2.5 `xe`, `i915` and `ttm` sources
+`build.sh` copies `kernel-devel` into `build/`, drops in the matching upstream `xe`, `i915` and `ttm` sources
 (downloaded from cdn.kernel.org and checksum-verified), applies the patches and builds `xe.ko` and
 `ttm.ko`. `install.sh` puts both in `/lib/modules/<kernel>/updates/`, keeps a backup of the
 initramfs and rebuilds it.
@@ -241,7 +273,7 @@ when that happens.
 
 Undo completely: `sudo ./revert.sh <kernel-version>` and reboot.
 
-Six changes can be switched off at runtime (as root):
+Six changes can be switched off at runtime (as root; 7.2.5 numbers, see the mapping above):
 ```
 echo 0 > /sys/module/xe/parameters/flip_boost          # 0006
 echo 0 > /sys/module/xe/parameters/tlb_inval_coalesce  # 0010
@@ -249,6 +281,10 @@ echo 0 > /sys/module/xe/parameters/shrink_active_ms    # 0021/0022
 echo 0 > /sys/module/xe/parameters/prefault_pages      # 0028: back to TTM's 16 pages per fault
 echo N > /sys/module/ttm/parameters/pool_cached        # 0033: stop pooling cached pages
 echo N > /sys/module/ttm/parameters/pool_clear_contig  # 0035: back to clearing page by page
+```
+On 7.3.3 also:
+```
+echo 0 > /sys/module/xe/parameters/skip_idle_teardown_preempt   # 0030: always send the 1 µs teardown preemption
 ```
 or permanently with `xe.flip_boost=0`, `ttm.pool_cached=0` and so on on the kernel command line.
 The pool's size cap is `ttm.page_pool_size` (pages per NUMA node).

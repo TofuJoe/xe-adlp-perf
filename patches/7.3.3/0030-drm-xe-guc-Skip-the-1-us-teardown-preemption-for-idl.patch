@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: TofuJoe <darryl.hon@gmail.com>
+Date: Tue, 3 Nov 2026 09:43:22 -0600
+Subject: [PATCH 30/30] drm/xe/guc: Skip the 1 us teardown preemption for idle
+ exec queues
+
+disable_scheduling_deregister() always sends a 1 us preemption-timeout
+policy for the context before the SCHED_CONTEXT_MODE_SET(DISABLE) +
+DEREGISTER pair, so a context that is still executing is taken off the
+hardware without waiting for its normal preemption timeout.
+
+On ADL-P (GuC 70.49.4) that request makes the GuC reset an engine even
+when the context has nothing to preempt: rcs queues that live 2-5 ms and
+never ran work (Nautilus, Wine, Xwayland startup) produce "Engine reset
+... state=0x3" followed by a "Timedout job" for seqno
+XE_FENCE_INITIAL_SEQNO, often attributed to a different, idle queue of the
+same process. Harmless but noisy.
+
+(A separate vcs failure, "GuC engine reset request failed" followed by a
+full GT reset under heavy VA decoder churn, also reproduces with this
+patch applied and with a stock module; this patch does not address it.)
+
+Only send the 1 us policy when the queue may still be executing: when not
+every emitted job has written its completion seqno
+(xe_exec_queue_is_idle()), or the queue is reset, banned or wedged, or it
+is part of a multi-queue group. "Killed" cannot be used as the criterion,
+because every user close kills the queue.
+
+The check is race-free: it runs from the CLEANUP message, after the last
+queue reference is gone. Every job holds a queue reference, so no job can
+be armed or submitted any more and the seqno only moves forward; an idle
+answer cannot become stale. A stale read of the seqno map only makes the
+queue look busy, which keeps the old behaviour. A job armed but never run
+also keeps the old behaviour. The seqno is written by the last flush's
+post-sync, after which the ring holds only MI_USER_INTERRUPT, so the
+queue's normal preemption timeout (640 ms here) never comes into play for
+an idle context and teardown latency does not change in practice.
+
+Disable at runtime with xe.skip_idle_teardown_preempt=0.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/gpu/drm/xe/xe_guc_submit.c | 35 +++++++++++++++++++++++++++++-
+ drivers/gpu/drm/xe/xe_module.c     |  5 +++++
+ drivers/gpu/drm/xe/xe_module.h     |  1 +
+ 3 files changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_guc_submit.c b/drivers/gpu/drm/xe/xe_guc_submit.c
+index b9e9cf5..6466d5b 100644
+--- a/drivers/gpu/drm/xe/xe_guc_submit.c
++++ b/drivers/gpu/drm/xe/xe_guc_submit.c
+@@ -1268,13 +1268,46 @@ static void handle_deregister_done(struct xe_guc *guc, struct xe_exec_queue *q);
+ 		GUC_CONTEXT_##enable_disable,				\
+ 	}
+ 
++/*
++ * The 1 us preemption timeout before the teardown disable exists to get a
++ * context that is still executing off the hardware without waiting for its
++ * normal preemption timeout. A queue whose every emitted job has already
++ * written its completion seqno has nothing left to preempt, and on ADL-P the
++ * GuC sometimes answers the 1 us request with an engine reset that fails on a
++ * video engine (escalating to a full GT reset) or that is attributed to an
++ * unrelated idle queue on rcs. Skip it for such queues and let the queue's
++ * normal policy apply to the disable.
++ *
++ * This runs from the CLEANUP message, i.e. after the last reference to the
++ * queue was dropped. Every job holds a queue reference, so no job can be
++ * created or armed any more and the seqno can only move forward: an idle
++ * answer cannot become stale. A stale read of the seqno map only makes the
++ * queue look busy, which keeps the old behaviour.
++ */
++static bool teardown_needs_min_preemption(struct xe_exec_queue *q)
++{
++	if (!xe_modparam.skip_idle_teardown_preempt)
++		return true;
++
++	/* Reset, banned or wedged: the hardware state is not trustworthy */
++	if (exec_queue_reset(q) || exec_queue_banned(q) || exec_queue_wedged(q))
++		return true;
++
++	/* The policy of a group primary covers the whole group */
++	if (xe_exec_queue_is_multi_queue(q))
++		return true;
++
++	return !xe_exec_queue_is_idle(q);
++}
++
+ static void disable_scheduling_deregister(struct xe_guc *guc,
+ 					  struct xe_exec_queue *q)
+ {
+ 	MAKE_SCHED_CONTEXT_ACTION(q, DISABLE);
+ 	int ret;
+ 
+-	if (!xe_exec_queue_is_multi_queue_secondary(q))
++	if (!xe_exec_queue_is_multi_queue_secondary(q) &&
++	    teardown_needs_min_preemption(q))
+ 		set_min_preemption_timeout(guc, q);
+ 
+ 	smp_rmb();
+diff --git a/drivers/gpu/drm/xe/xe_module.c b/drivers/gpu/drm/xe/xe_module.c
+index 2bf45f2..b16687d 100644
+--- a/drivers/gpu/drm/xe/xe_module.c
++++ b/drivers/gpu/drm/xe/xe_module.c
+@@ -32,6 +32,7 @@ struct xe_modparam xe_modparam = {
+ 	.svm_notifier_size =	XE_DEFAULT_SVM_NOTIFIER_SIZE,
+ 	.flip_boost =		true,
+ 	.tlb_inval_coalesce =	true,
++	.skip_idle_teardown_preempt = true,
+ 	.shrink_active_ms =	1000,
+ 	.prefault_pages =	512,
+ 	/* the rest are 0 by default */
+@@ -58,6 +59,10 @@ module_param_named(tlb_inval_coalesce, xe_modparam.tlb_inval_coalesce, bool, 060
+ MODULE_PARM_DESC(tlb_inval_coalesce, "On GPUs without range TLB invalidation, merge full PPGTT "
+ 		 "TLB invalidations requested while one is still in flight [default=true]");
+ 
++module_param_named(skip_idle_teardown_preempt, xe_modparam.skip_idle_teardown_preempt, bool, 0600);
++MODULE_PARM_DESC(skip_idle_teardown_preempt, "When destroying an exec queue whose jobs have all completed, "
++		 "don't ask the GuC to preempt it within 1 us first [default=true]");
++
+ #if IS_ENABLED(CONFIG_DRM_XE_DISPLAY)
+ module_param_named(probe_display, xe_modparam.probe_display, bool, 0444);
+ MODULE_PARM_DESC(probe_display, "Probe display HW, otherwise it's left untouched "
+diff --git a/drivers/gpu/drm/xe/xe_module.h b/drivers/gpu/drm/xe/xe_module.h
+index 1dc29fa..b8a2574 100644
+--- a/drivers/gpu/drm/xe/xe_module.h
++++ b/drivers/gpu/drm/xe/xe_module.h
+@@ -26,6 +26,7 @@ struct xe_modparam {
+ 	u32 svm_notifier_size;
+ 	bool flip_boost;
+ 	bool tlb_inval_coalesce;
++	bool skip_idle_teardown_preempt;
+ 	unsigned int shrink_active_ms;
+ 	unsigned int prefault_pages;
+ };
+-- 
+2.56.1
+

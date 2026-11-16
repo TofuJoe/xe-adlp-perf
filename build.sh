@@ -7,7 +7,7 @@
 # xz. Downloads linux-<upstream-version>.tar.xz from cdn.kernel.org once (to dl/) and checks
 # it against kernel.org's sha256sums.asc (checksum only; the file's PGP signature is not checked).
 # Output: build/<kernel-version>/xe.ko and build/<kernel-version>/ttm.ko (the TTM core module,
-# which patches 0033 and 0035 change; install.sh installs it alongside xe.ko).
+# which the ttm_pool patches change; install.sh installs it alongside xe.ko).
 set -euo pipefail
 R=$(cd "$(dirname "$0")" && pwd)
 K=${1:-$(uname -r)}
