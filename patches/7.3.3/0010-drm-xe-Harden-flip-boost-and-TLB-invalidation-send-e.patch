@@ -30,7 +30,7 @@ Assisted-by: Claude:claude-opus-5
  3 files changed, 117 insertions(+), 40 deletions(-)
 
 diff --git a/drivers/gpu/drm/xe/xe_guc_pc.c b/drivers/gpu/drm/xe/xe_guc_pc.c
-index 75b3771..fe7cb62 100644
+index 83e985e..1fba4d7 100644
 --- a/drivers/gpu/drm/xe/xe_guc_pc.c
 +++ b/drivers/gpu/drm/xe/xe_guc_pc.c
 @@ -1149,6 +1149,8 @@ static int pc_init_freqs(struct xe_guc_pc *pc)
@@ -98,7 +98,7 @@ index 75b3771..fe7cb62 100644
 +		goto unlock;
  	}
  
--	mod_delayed_work(system_unbound_wq, &pc->unboost_work,
+-	mod_delayed_work(system_dfl_wq, &pc->unboost_work,
 -			 msecs_to_jiffies(XE_GUC_PC_BOOST_HOLD_MS));
 +	/* Also refreshes the shared data read by pc_get_max_freq(). */
 +	if (xe_guc_pc_get_min_freq_locked(pc, &cur_min))
@@ -116,7 +116,7 @@ index 75b3771..fe7cb62 100644
 +unlock:
 +	mutex_unlock(&pc->freq_lock);
 +	if (arm)
-+		mod_delayed_work(system_unbound_wq, &pc->unboost_work,
++		mod_delayed_work(system_dfl_wq, &pc->unboost_work,
 +				 msecs_to_jiffies(XE_GUC_PC_BOOST_HOLD_MS));
 +	xe_pm_runtime_put(xe);
  }
@@ -168,7 +168,7 @@ index 75b3771..fe7cb62 100644
 +	}
 +
 +	if (ret == -EAGAIN && ++pc->boost_retries <= XE_GUC_PC_UNBOOST_MAX_RETRIES) {
- 		mod_delayed_work(system_unbound_wq, &pc->unboost_work,
+ 		mod_delayed_work(system_dfl_wq, &pc->unboost_work,
 -				 msecs_to_jiffies(XE_GUC_PC_BOOST_HOLD_MS));
 +				 msecs_to_jiffies(XE_GUC_PC_UNBOOST_RETRY_MS));
  		return;
@@ -177,7 +177,7 @@ index 75b3771..fe7cb62 100644
 -	if (!pc_set_min_freq(pc, pc->user_requested_min ?: pc->boost_saved_min))
 -		pc->boosted = false;
 -	else
--		mod_delayed_work(system_unbound_wq, &pc->unboost_work,
+-		mod_delayed_work(system_dfl_wq, &pc->unboost_work,
 -				 msecs_to_jiffies(XE_GUC_PC_BOOST_HOLD_MS));
 +	/* Done, or a non-transient error (already logged): stop trying. */
 +	pc->boosted = false;
@@ -202,7 +202,7 @@ index 75b3771..fe7cb62 100644
 +	if (!pc_boost_allowed(pc))
  		return;
  
- 	queue_work(system_unbound_wq, &pc->boost_work);
+ 	queue_work(system_dfl_wq, &pc->boost_work);
 @@ -1428,6 +1479,7 @@ static void xe_guc_pc_fini_hw(void *arg)
  	struct xe_guc_pc *pc = arg;
  	struct xe_device *xe = pc_to_xe(pc);

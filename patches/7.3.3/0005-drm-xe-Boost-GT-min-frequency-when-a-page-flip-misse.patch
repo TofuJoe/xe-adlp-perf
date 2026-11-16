@@ -148,7 +148,7 @@ index bccb603..e760d2c 100644
  	.has_auxccs = has_auxccs,
  };
 diff --git a/drivers/gpu/drm/xe/xe_guc_pc.c b/drivers/gpu/drm/xe/xe_guc_pc.c
-index 7cf8f48..75b3771 100644
+index 7cf8f48..83e985e 100644
 --- a/drivers/gpu/drm/xe/xe_guc_pc.c
 +++ b/drivers/gpu/drm/xe/xe_guc_pc.c
 @@ -32,6 +32,7 @@
@@ -199,7 +199,7 @@ index 7cf8f48..75b3771 100644
 +		}
 +	}
 +
-+	mod_delayed_work(system_unbound_wq, &pc->unboost_work,
++	mod_delayed_work(system_dfl_wq, &pc->unboost_work,
 +			 msecs_to_jiffies(XE_GUC_PC_BOOST_HOLD_MS));
 +}
 +
@@ -215,7 +215,7 @@ index 7cf8f48..75b3771 100644
 +
 +	/* GuC not running (reset/suspend): try again once it is back. */
 +	if (!pc->freq_ready) {
-+		mod_delayed_work(system_unbound_wq, &pc->unboost_work,
++		mod_delayed_work(system_dfl_wq, &pc->unboost_work,
 +				 msecs_to_jiffies(XE_GUC_PC_BOOST_HOLD_MS));
 +		return;
 +	}
@@ -223,7 +223,7 @@ index 7cf8f48..75b3771 100644
 +	if (!pc_set_min_freq(pc, pc->user_requested_min ?: pc->boost_saved_min))
 +		pc->boosted = false;
 +	else
-+		mod_delayed_work(system_unbound_wq, &pc->unboost_work,
++		mod_delayed_work(system_dfl_wq, &pc->unboost_work,
 +				 msecs_to_jiffies(XE_GUC_PC_BOOST_HOLD_MS));
 +}
 +
@@ -243,7 +243,7 @@ index 7cf8f48..75b3771 100644
 +	if (READ_ONCE(pc->power_profile) == SLPC_POWER_PROFILE_POWER_SAVING)
 +		return;
 +
-+	queue_work(system_unbound_wq, &pc->boost_work);
++	queue_work(system_dfl_wq, &pc->boost_work);
 +}
 +
  /**
