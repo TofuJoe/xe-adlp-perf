@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Mon, 14 Sep 2026 16:51:21 -0700
-Subject: [PATCH 10/30] drm/xe: Harden flip boost and TLB invalidation send
+Subject: [PATCH 10/32] drm/xe: Harden flip boost and TLB invalidation send
  errors
 
 Follow-up to the flip boost and TLB coalescing commits, from review:

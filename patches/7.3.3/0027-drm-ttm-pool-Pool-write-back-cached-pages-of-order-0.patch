@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Tue, 15 Sep 2026 15:37:46 -0700
-Subject: [PATCH 27/30] drm/ttm/pool: Pool write-back cached pages of order > 0
+Subject: [PATCH 27/32] drm/ttm/pool: Pool write-back cached pages of order > 0
 
 TTM keeps freed pages in per-caching, per-order pools only for write-combined
 and uncached pages, because pooling was introduced to avoid the cost of

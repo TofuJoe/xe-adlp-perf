@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Tue, 15 Sep 2026 10:29:54 -0700
-Subject: [PATCH 22/30] drm/xe/bo: Make the CPU fault prefault size tunable
+Subject: [PATCH 22/32] drm/xe/bo: Make the CPU fault prefault size tunable
  (xe.prefault_pages)
 
 __xe_bo_cpu_fault() always asked TTM for TTM_BO_VM_NUM_PREFAULT (16) pages

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Tue, 15 Sep 2026 10:29:27 -0700
-Subject: [PATCH 21/30] drm/xe/bo: Create the shmem backup file lazily, at
+Subject: [PATCH 21/32] drm/xe/bo: Create the shmem backup file lazily, at
  shrink time
 
 xe_ttm_tt_create() called ttm_tt_setup_backup() for every non-sg TT, which

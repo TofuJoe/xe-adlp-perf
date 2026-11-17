@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Karthik Poosa <karthik.poosa@intel.com>
 Date: Tue, 15 Sep 2026 10:25:08 -0700
-Subject: [PATCH 20/30] drm/xe/pcode: Increase default pcode mailbox timeout to
+Subject: [PATCH 20/32] drm/xe/pcode: Increase default pcode mailbox timeout to
  10ms
 
 The previous 1ms timeout may be insufficient for some mailbox commands,

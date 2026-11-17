@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Mon, 14 Sep 2026 21:32:24 -0600
-Subject: [PATCH 14/30] drm/xe/display: Size DPT/DSB pools for two active
+Subject: [PATCH 14/32] drm/xe/display: Size DPT/DSB pools for two active
  outputs, fix comments
 
 With eDP and an external output both active, each cycling ~3 buffers, four

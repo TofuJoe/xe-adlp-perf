@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Tue, 15 Sep 2026 10:31:29 -0700
-Subject: [PATCH 25/30] drm/i915/psr: Only visit PSR-enabled encoders on
+Subject: [PATCH 25/32] drm/i915/psr: Only visit PSR-enabled encoders on
  frontbuffer flush/invalidate
 
 intel_psr_flush() and intel_psr_invalidate() walked every encoder of the

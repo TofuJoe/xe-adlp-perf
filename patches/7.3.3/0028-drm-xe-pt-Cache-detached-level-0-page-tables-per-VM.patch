@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Tue, 15 Sep 2026 15:37:46 -0700
-Subject: [PATCH 28/30] drm/xe/pt: Cache detached level-0 page tables per VM
+Subject: [PATCH 28/32] drm/xe/pt: Cache detached level-0 page tables per VM
 
 Every bind of a fresh 2 MiB range creates a level-0 page table (kzalloc,
 a pinned and mapped BO with its TTM state and a page, client accounting)

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Tue, 3 Nov 2026 09:43:22 -0600
-Subject: [PATCH 30/30] drm/xe/guc: Skip the 1 us teardown preemption for idle
+Subject: [PATCH 30/32] drm/xe/guc: Skip the 1 us teardown preemption for idle
  exec queues
 
 disable_scheduling_deregister() always sends a 1 us preemption-timeout

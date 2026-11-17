@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Mon, 14 Sep 2026 16:27:14 -0700
-Subject: [PATCH 08/30] drm/xe: Skip the user fence wake-up when nobody is
+Subject: [PATCH 08/32] drm/xe: Skip the user fence wake-up when nobody is
  waiting
 
 xe_hw_engine_handle_irq() called wake_up_all() on the device-wide ufence

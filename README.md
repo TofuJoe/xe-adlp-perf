@@ -10,7 +10,7 @@
 # xe-adlp-perf
 
 Performance patches for the `xe` driver on **Alder Lake-P** integrated graphics, for Fedora 44
-kernels **7.3.3** (`patches/7.3.3/`, 30 patches) and **7.2.5** (`patches/7.2.5/`, 35 patches).
+kernels **7.3.3** (`patches/7.3.3/`, 32 patches) and **7.2.5** (`patches/7.2.5/`, 35 patches).
 They started as a fix for one bad bug: on a 5K external monitor, every page flip took 20–70 ms
 in the kernel, so the mouse cursor lagged whenever anything animated on screen (a Google Maps tab
 was enough). With that fixed, the rest of the flip, render and memory-pressure
@@ -190,7 +190,7 @@ rather than a slow frame.
 
 ## Kernel 7.3.3 (`patches/7.3.3/`)
 
-The 7.2.5 series rebased to 7.3.3, minus what 7.3 already contains, plus one new GuC patch. The
+The 7.2.5 series rebased to 7.3.3, minus what 7.3 already contains, plus one new GuC patch and two upstream fixes. The
 code of the rebased patches is unchanged except where noted.
 
 | 7.3.3 | 7.2.5 | Note |
@@ -206,6 +206,8 @@ code of the rebased patches is unchanged except where noted.
 | — | 0026 | Dropped: upstream in 7.3-rc1 |
 | 0021–0029 | 0027–0035 | 0027 and 0029 are the TTM patches (`ttm.ko`) |
 | 0030 | new | GuC: skip the 1 µs teardown preemption for idle exec queues (`xe.skip_idle_teardown_preempt`) |
+| 0031 | new | Upstream fix badac1974e09 (v7.4-rc3): program `CTX_CS_INDIRECT_CTX_OFFSET` again on pre-Xe2 |
+| 0032 | new | Upstream fix e2cdad51ec53: unwrap sync fences before adding them as job dependencies |
 
 0030: when an exec queue is destroyed, xe asks the GuC to preempt it within 1 µs. On ADL-P (GuC
 70.49.4) that makes the GuC reset the render engine even for short-lived queues that never ran any
@@ -213,7 +215,15 @@ work (Nautilus, Wine and Xwayland startup), which shows up as "Engine reset" + "
 lines in the kernel log. The patch skips the 1 µs policy when every job of the queue has
 completed. It removes that log noise; it does not fix a separate, rarer video-engine failure
 ("GuC engine reset request failed" followed by a full GT reset under heavy VA-API decoder churn),
-which also happens with a stock module.
+which also happens with a stock module. That failure is fixed by 0031.
+
+0031 and 0032 are upstream fixes picked into this series unchanged, apart from include context in 0032.
+0031 fixes the video-engine failure above. Since commit c9dfd66cb91e, xe restored the context's
+`INDIRECT_CTX_OFFSET` as 0 on pre-Xe2 parts, a value the PRM marks invalid. On this machine, a decoder churn test reproduced
+the GT reset within 6–113 s on every configuration tried, including a stock module. With 0031 it
+ran for 300 s with no reset. 0032: when a job waits on a timeline syncobj point that comes from an earlier job on the same exec
+queue, the scheduler now sees the dependency as same-queue. Before, it held the job until the earlier
+job had completed on the GPU.
 
 The 7.3.3 build was checked to produce the same `ttm.ko` code as the tested module and an `xe.ko`
 that differs from it only in four local diagnostic switches that are not published.

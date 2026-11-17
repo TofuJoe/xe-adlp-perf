@@ -1,0 +1,96 @@
+From ab61b73088a01e977d54911dbf79a2a5ebdc2f38 Mon Sep 17 00:00:00 2001
+From: "Chen, Junjia" <junjia.chen@intel.com>
+Date: Thu, 29 Oct 2026 00:13:58 +0800
+Subject: [PATCH 32/32] drm/xe: Unwrap sync fences before adding them as job
+ dependencies
+
+A timeline syncobj point is a dma_fence_chain node that carries its own
+fence context, separate from the contexts of the fences it wraps.
+xe_sync_entry_add_deps() passed that container straight to
+drm_sched_job_add_dependency().
+
+drm_sched_entity_add_dependency_cb() only drops a dependency when the
+fence context is one of the entity's own (fence_context or
+fence_context + 1). A chain node never matches, so a wait on a point
+whose inner fence is the finished fence of an earlier job on the same
+exec queue is treated like a cross-queue dependency: the job is held
+until the previous job has completed on the GPU. Every job queued
+behind it waits too, and the ring drains before the next batch of jobs
+is released.
+
+Unwrap the fence with dma_fence_unwrap_for_each() and add each
+unsignaled underlying fence as a dependency, so drm_sched sees the real
+fence contexts and ignores same-entity fences. Dependencies on other
+exec queues still wait for completion. drm_sched_job_add_dependency()
+keeps only the latest fence per context, so the dependency array does
+not grow with the length of the chain.
+
+Fixes: dd08ebf6c352 ("drm/xe: Introduce a new DRM driver for Intel GPUs")
+Cc: stable@vger.kernel.org
+Signed-off-by: Chen, Junjia <junjia.chen@intel.com>
+Reviewed-by: Matthew Brost <matthew.brost@intel.com>
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Link: https://lore.kernel.org/intel-xe/20261028161358.1917359-1-junjia.chen@intel.com/
+(cherry picked from commit 3b8860fe2581a8db796150728687ba1c6b78ddab)
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+[backport to 7.3.3: include context adjusted, linux/error-injection.h not present]
+---
+ drivers/gpu/drm/xe/xe_sync.c | 33 +++++++++++++++++++++++++++++----
+ 1 file changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_sync.c b/drivers/gpu/drm/xe/xe_sync.c
+index 3786676..021cf19 100644
+--- a/drivers/gpu/drm/xe/xe_sync.c
++++ b/drivers/gpu/drm/xe/xe_sync.c
+@@ -6,6 +6,7 @@
+ #include "xe_sync.h"
+ 
+ #include <linux/dma-fence-array.h>
++#include <linux/dma-fence-unwrap.h>
+ #include <linux/kthread.h>
+ #include <linux/sched/mm.h>
+ #include <linux/uaccess.h>
+@@ -233,11 +234,35 @@ ALLOW_ERROR_INJECTION(xe_sync_entry_parse, ERRNO);
+ 
+ int xe_sync_entry_add_deps(struct xe_sync_entry *sync, struct xe_sched_job *job)
+ {
+-	if (sync->fence)
+-		return  drm_sched_job_add_dependency(&job->drm,
+-						     dma_fence_get(sync->fence));
++	struct dma_fence_unwrap iter;
++	struct dma_fence *fence;
++	int err = 0;
+ 
+-	return 0;
++	if (!sync->fence)
++		return 0;
++
++	/*
++	 * Unwrap fence containers (e.g. dma_fence_chain from a timeline
++	 * syncobj) so the scheduler sees the underlying fences. That lets it
++	 * drop dependencies on jobs from the same entity and only wait for
++	 * jobs on the same scheduler to be scheduled, rather than waiting for
++	 * the container, which forces a full GPU completion wait and drains
++	 * the queue.
++	 */
++	dma_fence_unwrap_for_each(fence, &iter, sync->fence) {
++		/*
++		 * There is no dma_fence_unwrap_stop() helper to drop the
++		 * reference the iterator holds, so keep iterating without
++		 * doing anything once an error has occurred.
++		 */
++		if (err || dma_fence_is_signaled(fence))
++			continue;
++
++		err = drm_sched_job_add_dependency(&job->drm,
++						   dma_fence_get(fence));
++	}
++
++	return err;
+ }
+ 
+ /**
+-- 
+2.56.1
+

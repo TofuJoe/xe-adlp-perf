@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Tue, 15 Sep 2026 10:30:07 -0700
-Subject: [PATCH 23/30] drm/xe: Skip signaled fences when adding dma-resv
+Subject: [PATCH 23/32] drm/xe: Skip signaled fences when adding dma-resv
  dependencies to a job
 
 xe_sched_job_add_deps() forwarded to drm_sched_job_add_resv_dependencies(),

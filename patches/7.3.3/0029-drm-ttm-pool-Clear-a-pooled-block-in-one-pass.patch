@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: TofuJoe <darryl.hon@gmail.com>
 Date: Sat, 19 Sep 2026 21:12:11 -0600
-Subject: [PATCH 29/30] drm/ttm/pool: Clear a pooled block in one pass
+Subject: [PATCH 29/32] drm/ttm/pool: Clear a pooled block in one pass
 
 ttm_pool_type_give() cleared an order-N block one 4 KiB page at a time. The
 pages of such a block are physically contiguous and, without highmem, so is
